@@ -247,6 +247,7 @@ pub fn get_status(path: &Path) -> StatusFetch {
         lines_added,
         lines_removed,
         pr_info: None,
+        ci_checks: None,
         ahead,
         behind,
     })
@@ -287,6 +288,15 @@ pub fn get_current_branch(path: &Path) -> Option<String> {
     // Detached HEAD — return short hash of HEAD's commit.
     let id = head.id()?;
     Some(id.shorten().ok()?.to_string())
+}
+
+/// Get the full 40-character SHA of HEAD, or `None` if not a git repo or HEAD
+/// has no commits yet. Used for branch-level CI lookups via the GitHub REST
+/// API (`/commits/{sha}/check-runs` and `/status`).
+pub fn get_head_sha(path: &Path) -> Option<String> {
+    let repo = crate::gix_helpers::open(path)?;
+    let id = repo.head_id().ok()?;
+    Some(id.to_hex().to_string())
 }
 
 /// Get diff statistics (lines added, lines removed) for working directory.
@@ -777,7 +787,7 @@ pub fn get_pr_info(path: &Path) -> Option<super::PrInfo> {
                     }
                 }
             };
-            return Some(super::PrInfo { url, state, number, ci_checks: None });
+            return Some(super::PrInfo { url, state, number });
         }
     }
 
@@ -900,10 +910,25 @@ pub(crate) fn parse_ci_checks(json_str: &str) -> Option<super::CiCheckSummary> {
     })
 }
 
-/// Get CI check status for the current branch's PR.
-/// Uses `gh pr checks --json bucket,name,workflow,link,description,elapsed`
-/// to populate both the rollup summary and per-check details.
-pub fn get_ci_checks(path: &Path) -> Option<super::CiCheckSummary> {
+/// Get CI check status for the current branch.
+///
+/// When `has_pr` is true, uses `gh pr checks` (covers Actions + external
+/// status checks aggregated by the PR). Otherwise falls back to fetching
+/// `check-runs` + `status` on the current HEAD commit via `gh api`, which
+/// works for any pushed branch — including default branches without a PR.
+///
+/// Returns `None` when there are no checks, when `gh` isn't installed /
+/// authenticated, or when the repo has no GitHub remote.
+pub fn get_ci_checks(path: &Path, has_pr: bool) -> Option<super::CiCheckSummary> {
+    if has_pr {
+        get_pr_ci_checks(path)
+    } else {
+        get_branch_ci_checks(path)
+    }
+}
+
+/// Fetch CI checks via `gh pr checks` (PR-scoped — see `get_ci_checks`).
+fn get_pr_ci_checks(path: &Path) -> Option<super::CiCheckSummary> {
     let path_str = path.to_str()?;
 
     let output = safe_output(
@@ -924,6 +949,197 @@ pub fn get_ci_checks(path: &Path) -> Option<super::CiCheckSummary> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_ci_checks(stdout.trim())
+}
+
+/// Fetch CI checks for the current branch's HEAD commit via the REST API.
+/// Combines GitHub Actions check-runs with the older commit-status API
+/// (which is what services like Vercel, CircleCI deploy bots, etc. still
+/// use) into a single `CiCheckSummary`.
+fn get_branch_ci_checks(path: &Path) -> Option<super::CiCheckSummary> {
+    let path_str = path.to_str()?;
+    let sha = get_head_sha(path)?;
+
+    // `gh api` substitutes `{owner}` and `{repo}` from the current repo
+    // context, so we don't need to resolve the remote ourselves.
+    let check_runs_endpoint = format!("repos/{{owner}}/{{repo}}/commits/{}/check-runs", sha);
+    let status_endpoint = format!("repos/{{owner}}/{{repo}}/commits/{}/status", sha);
+
+    let check_runs_out = safe_output(
+        command("gh")
+            .args(["api", "--paginate", &check_runs_endpoint])
+            .current_dir(path_str),
+    )
+    .ok()?;
+
+    let statuses_out = safe_output(
+        command("gh")
+            .args(["api", &status_endpoint])
+            .current_dir(path_str),
+    )
+    .ok()?;
+
+    let check_runs_json = if check_runs_out.status.success() {
+        Some(String::from_utf8_lossy(&check_runs_out.stdout).into_owned())
+    } else {
+        None
+    };
+    let statuses_json = if statuses_out.status.success() {
+        Some(String::from_utf8_lossy(&statuses_out.stdout).into_owned())
+    } else {
+        None
+    };
+
+    if check_runs_json.is_none() && statuses_json.is_none() {
+        return None;
+    }
+
+    parse_branch_ci(check_runs_json.as_deref(), statuses_json.as_deref())
+}
+
+/// Parse the REST `check-runs` + `status` JSON payloads into a unified
+/// `CiCheckSummary`. Either input may be `None` (the other endpoint still
+/// supplies usable data); both being empty produces `None`.
+///
+/// `check-runs` is the modern GitHub Actions API — bucketing matches
+/// `gh pr checks` conventions (`pass`/`fail`/`pending`/`skipping`).
+/// `statuses` is the legacy commit-status API used by external services
+/// (Vercel, CircleCI deploy bots, …) — `state` is `success`/`failure`/
+/// `error`/`pending`.
+pub(crate) fn parse_branch_ci(
+    check_runs_json: Option<&str>,
+    statuses_json: Option<&str>,
+) -> Option<super::CiCheckSummary> {
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut pending = 0usize;
+    let mut checks: Vec<super::CiCheck> = Vec::new();
+
+    if let Some(json) = check_runs_json {
+        // `gh api --paginate` concatenates pages of objects by repeating the
+        // top-level envelope. Try parsing as a single object first; on failure
+        // fall through to a more permissive multi-object scan.
+        let mut runs: Vec<serde_json::Value> = Vec::new();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+            if let Some(arr) = v.get("check_runs").and_then(|x| x.as_array()) {
+                runs.extend(arr.iter().cloned());
+            }
+        } else {
+            // Concatenated pages — split on top-level `}{` boundaries.
+            for chunk in json.split("}{").map(|s| s.to_string()).collect::<Vec<_>>() {
+                let normalized = if !chunk.starts_with('{') { format!("{{{chunk}") } else { chunk.clone() };
+                let normalized = if !normalized.ends_with('}') { format!("{normalized}}}") } else { normalized };
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&normalized) {
+                    if let Some(arr) = v.get("check_runs").and_then(|x| x.as_array()) {
+                        runs.extend(arr.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        for run in runs {
+            let name = run.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)").to_string();
+            let status_str = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+            let (status, is_skipped) = match (status_str, conclusion) {
+                (_, "success") => { passed += 1; (super::CiStatus::Success, false) }
+                (_, "failure") | (_, "timed_out") | (_, "action_required") | (_, "cancelled") | (_, "stale") | (_, "startup_failure") => {
+                    failed += 1;
+                    (super::CiStatus::Failure, false)
+                }
+                (_, "skipped") | (_, "neutral") => (super::CiStatus::Pending, true),
+                ("queued", _) | ("in_progress", _) | ("waiting", _) | ("pending", _) | ("requested", _) => {
+                    pending += 1;
+                    (super::CiStatus::Pending, false)
+                }
+                _ => continue,
+            };
+            let link = run.get("html_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+            let description = run
+                .get("output")
+                .and_then(|o| o.get("summary"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let workflow = run
+                .get("check_suite")
+                .and_then(|s| s.get("workflow_id"))
+                .and_then(|_| run.get("app").and_then(|a| a.get("name")).and_then(|v| v.as_str()))
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let elapsed_ms = compute_elapsed_ms(
+                run.get("started_at").and_then(|v| v.as_str()),
+                run.get("completed_at").and_then(|v| v.as_str()),
+            );
+
+            checks.push(super::CiCheck {
+                name,
+                workflow,
+                status,
+                is_skipped,
+                link,
+                description,
+                elapsed_ms,
+            });
+        }
+    }
+
+    if let Some(json) = statuses_json {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+            if let Some(arr) = v.get("statuses").and_then(|x| x.as_array()) {
+                for st in arr {
+                    let name = st.get("context").and_then(|v| v.as_str()).unwrap_or("(unnamed)").to_string();
+                    let state = st.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    let (status, is_skipped) = match state {
+                        "success" => { passed += 1; (super::CiStatus::Success, false) }
+                        "failure" | "error" => { failed += 1; (super::CiStatus::Failure, false) }
+                        "pending" => { pending += 1; (super::CiStatus::Pending, false) }
+                        _ => continue,
+                    };
+                    let link = st.get("target_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+                    let description = st.get("description").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+                    let elapsed_ms = compute_elapsed_ms(
+                        st.get("created_at").and_then(|v| v.as_str()),
+                        st.get("updated_at").and_then(|v| v.as_str()),
+                    );
+                    checks.push(super::CiCheck {
+                        name,
+                        workflow: None,
+                        status,
+                        is_skipped,
+                        link,
+                        description,
+                        elapsed_ms,
+                    });
+                }
+            }
+        }
+    }
+
+    let total = passed + failed + pending;
+    if total == 0 && checks.is_empty() {
+        return None;
+    }
+    if total == 0 {
+        // Everything was skipped — nothing actionable.
+        return None;
+    }
+
+    let status = if failed > 0 {
+        super::CiStatus::Failure
+    } else if pending > 0 {
+        super::CiStatus::Pending
+    } else {
+        super::CiStatus::Success
+    };
+
+    Some(super::CiCheckSummary {
+        status,
+        passed,
+        failed,
+        pending,
+        total,
+        checks,
+    })
 }
 
 /// List worktrees found in the template container directory.
@@ -1626,6 +1842,95 @@ mod tests {
         assert!(deploy.is_skipped);
         assert_eq!(deploy.elapsed_ms, 0);
         assert_eq!(deploy.elapsed_label(), "\u{2014}");
+    }
+
+    // ─── branch-level CI parsing tests ─────────────────────────────────
+
+    #[test]
+    fn parse_branch_ci_check_runs_only() {
+        let json = r#"{
+            "total_count": 3,
+            "check_runs": [
+                {"name":"Lint","status":"completed","conclusion":"success","html_url":"https://x/1","started_at":"2024-01-01T10:00:00Z","completed_at":"2024-01-01T10:00:30Z"},
+                {"name":"Test","status":"completed","conclusion":"failure","html_url":"https://x/2","started_at":"2024-01-01T10:00:00Z","completed_at":"2024-01-01T10:01:00Z"},
+                {"name":"Deploy","status":"in_progress","conclusion":null}
+            ]
+        }"#;
+        let result = super::parse_branch_ci(Some(json), None).unwrap();
+        assert_eq!(result.status, super::super::CiStatus::Failure);
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.pending, 1);
+        assert_eq!(result.total, 3);
+        assert_eq!(result.checks.len(), 3);
+        assert_eq!(result.checks[0].link.as_deref(), Some("https://x/1"));
+        assert_eq!(result.checks[0].elapsed_ms, 30_000);
+    }
+
+    #[test]
+    fn parse_branch_ci_skipped_and_neutral_excluded_from_total() {
+        let json = r#"{
+            "check_runs": [
+                {"name":"A","status":"completed","conclusion":"success"},
+                {"name":"B","status":"completed","conclusion":"skipped"},
+                {"name":"C","status":"completed","conclusion":"neutral"}
+            ]
+        }"#;
+        let result = super::parse_branch_ci(Some(json), None).unwrap();
+        assert_eq!(result.status, super::super::CiStatus::Success);
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.total, 1);
+        // Skipped/neutral still appear in the per-check list, marked as skipped.
+        assert_eq!(result.checks.len(), 3);
+        assert!(result.checks.iter().filter(|c| c.is_skipped).count() == 2);
+    }
+
+    #[test]
+    fn parse_branch_ci_statuses_only() {
+        let json = r#"{
+            "state": "success",
+            "statuses": [
+                {"context":"vercel/deploy","state":"success","target_url":"https://v/1","description":"ok","created_at":"2024-01-01T10:00:00Z","updated_at":"2024-01-01T10:00:42Z"},
+                {"context":"netlify","state":"pending"}
+            ]
+        }"#;
+        let result = super::parse_branch_ci(None, Some(json)).unwrap();
+        assert_eq!(result.status, super::super::CiStatus::Pending);
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.pending, 1);
+        assert_eq!(result.total, 2);
+        assert_eq!(result.checks[0].name, "vercel/deploy");
+        assert_eq!(result.checks[0].elapsed_ms, 42_000);
+    }
+
+    #[test]
+    fn parse_branch_ci_combines_runs_and_statuses() {
+        let runs = r#"{"check_runs":[{"name":"Lint","status":"completed","conclusion":"success"}]}"#;
+        let statuses = r#"{"statuses":[{"context":"vercel/deploy","state":"failure"}]}"#;
+        let result = super::parse_branch_ci(Some(runs), Some(statuses)).unwrap();
+        assert_eq!(result.status, super::super::CiStatus::Failure);
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.total, 2);
+        assert_eq!(result.checks.len(), 2);
+    }
+
+    #[test]
+    fn parse_branch_ci_both_empty_returns_none() {
+        let runs = r#"{"check_runs":[]}"#;
+        let statuses = r#"{"statuses":[]}"#;
+        assert!(super::parse_branch_ci(Some(runs), Some(statuses)).is_none());
+    }
+
+    #[test]
+    fn parse_branch_ci_only_skipped_returns_none() {
+        let runs = r#"{"check_runs":[{"name":"A","status":"completed","conclusion":"skipped"}]}"#;
+        assert!(super::parse_branch_ci(Some(runs), None).is_none());
+    }
+
+    #[test]
+    fn parse_branch_ci_invalid_json_returns_none() {
+        assert!(super::parse_branch_ci(Some("not json"), Some("also not json")).is_none());
     }
 
     // ─── commit graph parsing tests ────────────────────────────────────

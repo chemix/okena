@@ -4,6 +4,7 @@
 use super::GitHeader;
 use crate::project_header;
 
+use okena_core::process::open_url;
 use okena_core::theme::ThemeColors;
 use okena_git::GitStatus;
 use okena_ui::tokens::ui_text_sm;
@@ -45,10 +46,11 @@ impl GitHeader {
                     .child({
                         let entity_for_branch_bounds = entity_handle.clone();
                         let entity_for_branch_click = entity_handle.clone();
-                        let entity_for_pr_bounds = entity_handle.clone();
-                        let entity_for_pr_click = entity_handle.clone();
+                        let entity_for_ci_bounds = entity_handle.clone();
+                        let entity_for_ci_click = entity_handle.clone();
                         let supports_switch = self.git_provider.supports_mutations();
-                        let has_pr = status.pr_info.is_some();
+                        let has_ci = status.ci_checks.is_some();
+                        let pr_url = status.pr_info.as_ref().map(|p| p.url.clone());
                         let on_branch_click: Option<Arc<dyn Fn(&mut Window, &mut App)>> =
                             if supports_switch {
                                 Some(Arc::new(move |window, app| {
@@ -64,10 +66,16 @@ impl GitHeader {
                                 None
                             };
                         let on_pr_click: Option<Arc<dyn Fn(&mut Window, &mut App)>> =
-                            if has_pr {
+                            pr_url.map(|url| -> Arc<dyn Fn(&mut Window, &mut App)> {
+                                Arc::new(move |_window, _app| {
+                                    open_url(&url);
+                                })
+                            });
+                        let on_ci_click: Option<Arc<dyn Fn(&mut Window, &mut App)>> =
+                            if has_ci {
                                 Some(Arc::new(move |_window, app| {
-                                    let _ = entity_for_pr_click.update(app, |this, cx| {
-                                        this.toggle_pr_checks(cx);
+                                    let _ = entity_for_ci_click.update(app, |this, cx| {
+                                        this.toggle_ci_checks(cx);
                                     });
                                 }))
                             } else {
@@ -83,11 +91,11 @@ impl GitHeader {
                             } else {
                                 None
                             };
-                        let on_pr_bounds: Option<Arc<dyn Fn(Bounds<Pixels>, &mut App)>> =
-                            if has_pr {
+                        let on_ci_bounds: Option<Arc<dyn Fn(Bounds<Pixels>, &mut App)>> =
+                            if has_ci {
                                 Some(Arc::new(move |bounds, app| {
-                                    let _ = entity_for_pr_bounds.update(app, |this, _cx| {
-                                        this.set_pr_badge_bounds(bounds);
+                                    let _ = entity_for_ci_bounds.update(app, |this, _cx| {
+                                        this.set_ci_badge_bounds(bounds);
                                     });
                                 }))
                             } else {
@@ -98,8 +106,9 @@ impl GitHeader {
                             project_header::BranchStatusCallbacks {
                                 on_branch_click,
                                 on_pr_click,
+                                on_ci_click,
                                 on_branch_bounds,
-                                on_pr_bounds,
+                                on_ci_bounds,
                             },
                             t,
                         )

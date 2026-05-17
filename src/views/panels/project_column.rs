@@ -362,6 +362,7 @@ impl ProjectColumn {
                         lines_added: g.lines_added,
                         lines_removed: g.lines_removed,
                         pr_info: None,
+                        ci_checks: None,
                         ahead: None,
                         behind: None,
                     })
@@ -809,13 +810,14 @@ impl Render for ProjectColumn {
                             gh.render_branch_picker(window, &t, cx)
                         })
                     })
-                    // PR checks popover (delegated to GitHeader entity)
+                    // CI checks popover (delegated to GitHeader entity)
                     .child({
-                        let pr_info = self.git_watcher.as_ref()
-                            .and_then(|w| w.read(cx).get(&self.project_id).cloned())
-                            .and_then(|g| g.pr_info);
+                        let git_status = self.git_watcher.as_ref()
+                            .and_then(|w| w.read(cx).get(&self.project_id).cloned());
+                        let ci_checks = git_status.as_ref().and_then(|g| g.ci_checks.clone());
+                        let pr_info = git_status.and_then(|g| g.pr_info);
                         self.git_header.update(cx, |gh, cx| {
-                            gh.render_pr_checks_popover(pr_info.as_ref(), &t, cx)
+                            gh.render_ci_checks_popover(ci_checks.as_ref(), pr_info.as_ref(), &t, cx)
                         })
                     })
                     .into_any_element()

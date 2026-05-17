@@ -18,7 +18,7 @@ use std::sync::Arc;
 mod branch_picker;
 mod commit_log;
 mod diff_popover;
-mod pr_checks;
+mod ci_checks_popover;
 mod status_pill;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -94,9 +94,9 @@ pub struct GitHeader {
     branch_picker_create_name: Entity<SimpleInputState>,
     branch_picker_status: BranchPickerStatus,
 
-    // ── PR checks popover state ─────────────────────────────────────
-    pr_checks_visible: bool,
-    pr_badge_bounds: Bounds<Pixels>,
+    // ── CI checks popover state ─────────────────────────────────────
+    ci_checks_visible: bool,
+    ci_badge_bounds: Bounds<Pixels>,
 }
 
 impl GitHeader {
@@ -147,8 +147,8 @@ impl GitHeader {
             branch_picker_create_mode: false,
             branch_picker_create_name,
             branch_picker_status: BranchPickerStatus::Idle,
-            pr_checks_visible: false,
-            pr_badge_bounds: Bounds::default(),
+            ci_checks_visible: false,
+            ci_badge_bounds: Bounds::default(),
         }
     }
 

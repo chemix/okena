@@ -167,7 +167,8 @@ impl GitStatusWatcher {
                 };
 
                 // Phase 3: Fetch CI check status — adaptive interval based on pending state.
-                // Only for projects that have a known PR.
+                // Runs for every project; uses `gh pr checks` when a PR is known,
+                // falls back to branch-level `check-runs`/`status` otherwise.
                 let new_ci_checks: HashMap<String, Option<okena_git::CiCheckSummary>> = if check_ci {
                     let pr_infos_snapshot: HashMap<String, Option<okena_git::PrInfo>> = if check_prs {
                         // Use freshly fetched PR info
@@ -177,13 +178,13 @@ impl GitStatusWatcher {
                         this.update(cx, |this, _| this.pr_infos.clone()).unwrap_or_default()
                     };
                     let ci_futures: Vec<_> = projects.iter()
-                        .filter(|(id, _)| pr_infos_snapshot.get(id).map(|p| p.is_some()).unwrap_or(false))
                         .map(|(id, path)| {
                             let id = id.clone();
                             let path = path.clone();
+                            let has_pr = pr_infos_snapshot.get(&id).map(|p| p.is_some()).unwrap_or(false);
                             async move {
                                 let checks = smol::unblock(move || {
-                                    git::repository::get_ci_checks(Path::new(&path))
+                                    git::repository::get_ci_checks(Path::new(&path), has_pr)
                                 }).await;
                                 (id, checks)
                             }
@@ -215,10 +216,8 @@ impl GitStatusWatcher {
                     // Inject cached PR info + CI checks into statuses
                     for (id, status) in new_statuses.iter_mut() {
                         if let Some(Some(status)) = status.as_mut().map(Some) {
-                            if let Some(mut pr) = this.pr_infos.get(id).cloned().flatten() {
-                                pr.ci_checks = this.ci_checks.get(id).cloned().flatten();
-                                status.pr_info = Some(pr);
-                            }
+                            status.pr_info = this.pr_infos.get(id).cloned().flatten();
+                            status.ci_checks = this.ci_checks.get(id).cloned().flatten();
                         }
                     }
 

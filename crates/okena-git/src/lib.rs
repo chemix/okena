@@ -174,8 +174,6 @@ pub struct PrInfo {
     pub url: String,
     pub state: PrState,
     pub number: u32,
-    #[serde(default)]
-    pub ci_checks: Option<CiCheckSummary>,
 }
 
 /// Git status information for display in project header
@@ -190,6 +188,11 @@ pub struct GitStatus {
     /// Pull request info for the current branch (if any)
     #[serde(default)]
     pub pr_info: Option<PrInfo>,
+    /// CI / pipeline status for the current branch's HEAD commit.
+    /// Populated from the PR's checks when a PR exists, otherwise from
+    /// branch-level check-runs and statuses on the commit itself.
+    #[serde(default)]
+    pub ci_checks: Option<CiCheckSummary>,
     /// Number of commits the local branch is ahead of its upstream.
     /// `None` when there is no upstream or HEAD is detached.
     #[serde(default)]
@@ -331,6 +334,7 @@ pub fn warm_branch_cache(path: &Path) {
             lines_added: 0,
             lines_removed: 0,
             pr_info: None,
+            ci_checks: None,
             ahead: None,
             behind: None,
         }));
