@@ -280,6 +280,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub diff_ignore_whitespace: bool,
 
+    /// Whether the per-line git blame gutter is shown in the file viewer.
+    #[serde(default)]
+    pub blame_visible: bool,
+
     /// When true, file viewer / diff viewer (and other detachable overlays)
     /// open directly in a separate OS window instead of as a modal.
     #[serde(default)]
@@ -369,6 +373,7 @@ impl Default for AppSettings {
             remote_listen_address: default_remote_listen_address(),
             min_column_width: default_min_column_width(),
             diff_ignore_whitespace: false,
+            blame_visible: false,
             detached_overlays_by_default: false,
             detached_overlay_bounds: None,
             auto_update_enabled: default_auto_update_enabled(),

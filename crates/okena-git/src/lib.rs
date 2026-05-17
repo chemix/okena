@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod blame;
 pub mod branch_names;
 pub mod diff;
 pub mod error;
 pub(crate) mod gix_helpers;
 pub mod repository;
 
+pub use blame::{get_blame, BlameCommit, BlameError, BlameKind, BlameLine};
 pub use error::{GitError, GitResult};
 pub use diff::{DiffResult, DiffMode, FileDiff, DiffLineType, get_diff_with_options, is_git_repo, get_file_contents_for_diff};
 pub use repository::{

@@ -111,6 +111,7 @@ impl SettingsState {
     }
     setting_setter!(set_show_shell_selector, show_shell_selector, bool);
     setting_setter!(set_terminal_ctrl_c_copies_selection, terminal_ctrl_c_copies_selection, bool);
+    setting_setter!(set_blame_visible, blame_visible, bool);
 
     /// Set file finder "show ignored" preference (persisted default for future opens).
     pub fn set_file_finder_show_ignored(&mut self, value: bool, cx: &mut Context<Self>) {

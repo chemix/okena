@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod blame;
 pub mod code_view;
 pub mod project_fs;
 pub mod content_search;

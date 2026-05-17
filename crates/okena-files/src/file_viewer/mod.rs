@@ -3,12 +3,15 @@
 //! Provides a read-only view of files with syntax highlighting via syntect.
 //! Markdown files can be viewed in rendered preview mode.
 
+mod blame_load;
+mod blame_render;
 mod context_menu;
 mod loading;
 mod render;
 mod search;
 mod selection;
 
+use crate::blame::{BlameError, BlameLine, BlameProvider};
 use crate::code_view::ScrollbarDrag;
 use crate::list_directory::DirEntry;
 use crate::selection::SelectionState;
@@ -73,6 +76,19 @@ pub(super) struct FileViewerTab {
     pub modified_at: Option<SystemTime>,
     /// Whether the tab content is still being loaded asynchronously.
     pub loading: bool,
+    /// Per-line git blame for this file. Lazy-loaded when the user toggles
+    /// the blame gutter on.
+    pub blame: BlameLoadState,
+}
+
+/// Lifecycle of a tab's blame data.
+#[derive(Clone, Debug, Default)]
+pub enum BlameLoadState {
+    #[default]
+    NotLoaded,
+    Loading,
+    Loaded(std::sync::Arc<Vec<BlameLine>>),
+    Error(BlameError),
 }
 
 impl FileViewerTab {
@@ -96,6 +112,7 @@ impl FileViewerTab {
             scrollbar_drag: None,
             modified_at: None,
             loading: false,
+            blame: BlameLoadState::NotLoaded,
         }
     }
 
@@ -124,6 +141,7 @@ impl FileViewerTab {
             scrollbar_drag: None,
             modified_at: None,
             loading: true,
+            blame: BlameLoadState::NotLoaded,
         }
     }
 
@@ -262,6 +280,11 @@ pub struct FileViewer {
     /// True when this viewer is hosted inside a detached window.
     /// Hides the "detach" button and is set by the detached host.
     pub(super) is_detached: bool,
+    /// Optional provider for per-file git blame. `None` for projects that
+    /// can't supply blame (no host wiring, non-git filesystems, etc).
+    pub(super) blame_provider: Option<std::sync::Arc<dyn BlameProvider>>,
+    /// Whether the blame gutter column is visible. Persisted in settings.
+    pub(super) blame_visible: bool,
 }
 
 impl FileViewer {
@@ -283,6 +306,8 @@ impl FileViewer {
     pub fn new(
         relative_path: String,
         project_fs: std::sync::Arc<dyn crate::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn BlameProvider>>,
+        blame_visible: bool,
         font_size: f32,
         is_dark: bool,
         cx: &mut Context<Self>,
@@ -320,12 +345,17 @@ impl FileViewer {
             delete_confirm: None,
             search_state: None,
             is_detached: false,
+            blame_provider,
+            blame_visible,
         };
 
         // Kick off the root directory listing and any expanded ancestors so
         // the tree fills in around the opened file.
         viewer.fetch_initial_dirs(cx);
         viewer.spawn_tab_load(relative_path, cx);
+        if viewer.blame_visible {
+            viewer.spawn_blame_load_for_active(cx);
+        }
         viewer
     }
 
@@ -334,6 +364,8 @@ impl FileViewer {
     /// Opens the sidebar file tree with no file loaded.
     pub fn new_browse(
         project_fs: std::sync::Arc<dyn crate::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn BlameProvider>>,
+        blame_visible: bool,
         font_size: f32,
         is_dark: bool,
         cx: &mut Context<Self>,
@@ -366,6 +398,8 @@ impl FileViewer {
             delete_confirm: None,
             search_state: None,
             is_detached: false,
+            blame_provider,
+            blame_visible,
         };
         viewer.fetch_initial_dirs(cx);
         viewer
@@ -406,6 +440,7 @@ impl FileViewer {
             }
             // Reload externally modified files (also re-highlights)
             if tab.reload_if_changed(&self.syntax_set, self.is_dark) {
+                tab.blame = BlameLoadState::NotLoaded;
                 continue;
             }
             // Theme changed — re-highlight without reloading
@@ -416,6 +451,12 @@ impl FileViewer {
                     self.is_dark,
                 );
             }
+        }
+
+        // Kick off blame load for the active tab if the gutter is visible and
+        // its blame got invalidated by the reload above.
+        if self.blame_visible {
+            self.spawn_blame_load_for_active(cx);
         }
     }
 
@@ -639,6 +680,9 @@ impl FileViewer {
             let current = self.active_tab().relative_path.clone();
             self.history.push(&current);
             self.active_tab = index;
+            if self.blame_visible {
+                self.spawn_blame_load_for_active(cx);
+            }
             // Update expanded folders to reveal active tab's file
             let tab_rel = self.tabs[self.active_tab].relative_path.clone();
             self.expand_ancestors_and_fetch(&tab_rel, cx);
@@ -709,7 +753,11 @@ impl FileViewer {
                     this.tabs.iter_mut().find(|t| t.relative_path == relative_path)
                 {
                     tab.apply_loaded_content(result, &this.syntax_set, this.is_dark);
+                    tab.blame = BlameLoadState::NotLoaded;
                     cx.notify();
+                }
+                if this.blame_visible {
+                    this.spawn_blame_load_for_active(cx);
                 }
             });
         })
@@ -740,6 +788,10 @@ pub enum FileViewerEvent {
     Close,
     /// User requested to detach the viewer into a separate OS window.
     Detach,
+    /// User clicked a blame entry — open the named commit in the diff viewer.
+    OpenCommit(String),
+    /// User toggled the blame gutter — host persists the preference.
+    BlamePreferenceChanged(bool),
 }
 
 impl EventEmitter<FileViewerEvent> for FileViewer {}

@@ -146,6 +146,10 @@ impl FileViewer {
                             .flex_shrink_0(),
                     ),
             )
+            .when_some(
+                self.render_blame_cell(line_number, line_height, char_width, t, cx),
+                |d, cell| d.child(cell),
+            )
             .child(
                 div()
                     .flex_1()
@@ -890,6 +894,13 @@ impl Render for FileViewer {
                     "tab" if modifiers.control => {
                         this.next_tab(cx);
                     }
+                    "b" if (modifiers.platform || modifiers.control) && modifiers.alt => {
+                        if this.blame_provider.is_some() {
+                            this.toggle_blame(cx);
+                            let visible = this.blame_visible();
+                            cx.emit(super::FileViewerEvent::BlamePreferenceChanged(visible));
+                        }
+                    }
                     "b" if !modifiers.platform && !modifiers.control => {
                         this.toggle_sidebar(cx);
                     }
@@ -1027,6 +1038,37 @@ impl Render for FileViewer {
                     .child(
                         h_flex()
                             .gap(px(12.0))
+                            .when(self.blame_provider.is_some(), |d| {
+                                let on = self.blame_visible;
+                                d.child(
+                                    div()
+                                        .id("blame-toggle")
+                                        .cursor_pointer()
+                                        .px(px(8.0))
+                                        .py(px(4.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(if on { t.bg_selection } else { t.bg_secondary }))
+                                        .hover(|s| s.bg(rgb(t.bg_hover)))
+                                        .tooltip(|window, cx| {
+                                            gpui_component::tooltip::Tooltip::new("Toggle git blame").build(window, cx)
+                                        })
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.toggle_blame(cx);
+                                            let visible = this.blame_visible();
+                                            cx.emit(super::FileViewerEvent::BlamePreferenceChanged(visible));
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_size(ui_text_sm(cx))
+                                                .text_color(rgb(if on {
+                                                    t.text_primary
+                                                } else {
+                                                    t.text_muted
+                                                }))
+                                                .child("Blame"),
+                                        ),
+                                )
+                            })
                             .when(is_markdown, |d| {
                                 d.child(
                                     div()

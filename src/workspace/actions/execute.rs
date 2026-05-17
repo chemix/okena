@@ -375,6 +375,38 @@ pub fn execute_action(
                 None => ActionResult::Err(format!("project not found: {}", project_id)),
             }
         }
+        ActionRequest::GitBlame { project_id, relative_path } => {
+            match ws.project(&project_id) {
+                Some(p) => {
+                    let path = p.path.clone();
+                    match okena_git::get_blame(std::path::Path::new(&path), &relative_path) {
+                        Ok(lines) => {
+                            let wire: Vec<_> = lines
+                                .into_iter()
+                                .map(|l| serde_json::json!({
+                                    "line_number": l.line_number,
+                                    "commit": {
+                                        "hash": l.commit.hash,
+                                        "short_hash": l.commit.short_hash,
+                                        "author": l.commit.author,
+                                        "author_email": l.commit.author_email,
+                                        "timestamp": l.commit.timestamp,
+                                        "summary": l.commit.summary,
+                                    },
+                                    "kind": match l.kind {
+                                        okena_git::BlameKind::Committed => "Committed",
+                                        okena_git::BlameKind::Uncommitted => "Uncommitted",
+                                    },
+                                }))
+                                .collect();
+                            ActionResult::Ok(Some(serde_json::Value::Array(wire)))
+                        }
+                        Err(e) => ActionResult::Err(e.to_string()),
+                    }
+                }
+                None => ActionResult::Err(format!("project not found: {}", project_id)),
+            }
+        }
         ActionRequest::ListFiles { project_id, show_ignored } => {
             match ws.project(&project_id) {
                 Some(p) => {

@@ -162,6 +162,9 @@ pub enum OverlayManagerEvent {
     TabCloseOthers { project_id: String, layout_path: Vec<usize>, tab_index: usize },
     /// Tab context menu: close tabs to the right
     TabCloseToRight { project_id: String, layout_path: Vec<usize>, tab_index: usize },
+
+    /// File viewer blame click: open the named commit in the diff viewer.
+    OpenCommitFromBlame { project_id: String, hash: String },
 }
 
 /// Closure that, when invoked, detaches the currently active modal into a
@@ -1157,17 +1160,28 @@ impl OverlayManager {
     // ========================================================================
 
     /// Toggle file search dialog for a project.
-    pub fn toggle_file_search(&mut self, fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>, cx: &mut Context<Self>) {
+    pub fn toggle_file_search(
+        &mut self,
+        fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_modal::<FileSearchDialog>() {
             self.close_modal(cx);
         } else {
-            self.show_file_search(fs, cx);
+            self.show_file_search(fs, blame_provider, cx);
         }
     }
 
     /// Show file search dialog for a project.
-    pub fn show_file_search(&mut self, fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>, cx: &mut Context<Self>) {
+    pub fn show_file_search(
+        &mut self,
+        fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>>,
+        cx: &mut Context<Self>,
+    ) {
         let fs_for_viewer = fs.clone();
+        let blame_for_viewer = blame_provider.clone();
         let settings = crate::settings::settings(cx).file_finder.clone();
         let dialog = cx.new(|cx| {
             FileSearchDialog::new(fs, settings.show_ignored, cx)
@@ -1181,7 +1195,7 @@ impl OverlayManager {
                 FileSearchDialogEvent::FileSelected(relative_path) => {
                     let relative_path = relative_path.clone();
                     this.close_modal(cx);
-                    this.show_file_viewer(relative_path, fs_for_viewer.clone(), cx);
+                    this.show_file_viewer(relative_path, fs_for_viewer.clone(), blame_for_viewer.clone(), cx);
                 }
                 FileSearchDialogEvent::FiltersChanged { show_ignored } => {
                     let show_ignored = *show_ignored;
@@ -1202,17 +1216,30 @@ impl OverlayManager {
     // ========================================================================
 
     /// Toggle content search dialog for a project.
-    pub fn toggle_content_search(&mut self, fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>, is_dark: bool, cx: &mut Context<Self>) {
+    pub fn toggle_content_search(
+        &mut self,
+        fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>>,
+        is_dark: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_modal::<ContentSearchDialog>() {
             self.close_modal(cx);
         } else {
-            self.show_content_search(fs, is_dark, cx);
+            self.show_content_search(fs, blame_provider, is_dark, cx);
         }
     }
 
     /// Show content search dialog for a project.
-    pub fn show_content_search(&mut self, fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>, is_dark: bool, cx: &mut Context<Self>) {
+    pub fn show_content_search(
+        &mut self,
+        fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>>,
+        is_dark: bool,
+        cx: &mut Context<Self>,
+    ) {
         let fs_for_viewer = fs.clone();
+        let blame_for_viewer = blame_provider.clone();
         let dialog = cx.new(|cx| ContentSearchDialog::new(fs, is_dark, cx));
 
         cx.subscribe(&dialog, move |this, _, event: &ContentSearchDialogEvent, cx| {
@@ -1223,7 +1250,7 @@ impl OverlayManager {
                 ContentSearchDialogEvent::FileSelected { relative_path, line: _ } => {
                     let relative_path = relative_path.clone();
                     this.close_modal(cx);
-                    this.show_file_viewer(relative_path, fs_for_viewer.clone(), cx);
+                    this.show_file_viewer(relative_path, fs_for_viewer.clone(), blame_for_viewer.clone(), cx);
                 }
             }
         })
@@ -1238,19 +1265,31 @@ impl OverlayManager {
     // ========================================================================
 
     /// Show file browser for a project (no pre-selected file).
-    pub fn show_file_browser(&mut self, fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>, cx: &mut Context<Self>) {
-        let font_size = crate::settings::settings_entity(cx).read(cx).settings.file_font_size;
+    pub fn show_file_browser(
+        &mut self,
+        fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>>,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = crate::settings::settings_entity(cx).read(cx).settings.clone();
+        let font_size = settings.file_font_size;
+        let blame_visible = settings.blame_visible;
         let is_dark = crate::theme::theme(cx).is_dark();
         let cache_key = fs.project_id();
 
         // Reuse cached viewer if available
         if let Some(viewer) = self.cached_file_viewers.get(&cache_key) {
-            viewer.update(cx, |v, cx| v.update_config(font_size, is_dark, cx));
+            viewer.update(cx, |v, cx| {
+                v.update_config(font_size, is_dark, cx);
+                v.set_blame_visible(blame_visible, cx);
+            });
             self.open_file_viewer_modal(viewer.clone(), cx);
             return;
         }
 
-        let viewer = cx.new(|cx| FileViewer::new_browse(fs, font_size, is_dark, cx));
+        let viewer = cx.new(|cx| {
+            FileViewer::new_browse(fs, blame_provider, blame_visible, font_size, is_dark, cx)
+        });
 
         self.subscribe_file_viewer(&viewer, cx);
         self.cached_file_viewers.insert(cache_key, viewer.clone());
@@ -1259,8 +1298,16 @@ impl OverlayManager {
     }
 
     /// Show file viewer for a file.
-    pub fn show_file_viewer(&mut self, relative_path: String, fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>, cx: &mut Context<Self>) {
-        let font_size = crate::settings::settings_entity(cx).read(cx).settings.file_font_size;
+    pub fn show_file_viewer(
+        &mut self,
+        relative_path: String,
+        fs: std::sync::Arc<dyn okena_files::project_fs::ProjectFs>,
+        blame_provider: Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>>,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = crate::settings::settings_entity(cx).read(cx).settings.clone();
+        let font_size = settings.file_font_size;
+        let blame_visible = settings.blame_visible;
         let is_dark = crate::theme::theme(cx).is_dark();
         let cache_key = fs.project_id();
 
@@ -1268,13 +1315,24 @@ impl OverlayManager {
         if let Some(viewer) = self.cached_file_viewers.get(&cache_key) {
             viewer.update(cx, |v, cx| {
                 v.update_config(font_size, is_dark, cx);
+                v.set_blame_visible(blame_visible, cx);
                 v.open_file_in_tab(relative_path.clone(), cx);
             });
             self.open_file_viewer_modal(viewer.clone(), cx);
             return;
         }
 
-        let viewer = cx.new(|cx| FileViewer::new(relative_path.clone(), fs, font_size, is_dark, cx));
+        let viewer = cx.new(|cx| {
+            FileViewer::new(
+                relative_path.clone(),
+                fs,
+                blame_provider,
+                blame_visible,
+                font_size,
+                is_dark,
+                cx,
+            )
+        });
 
         self.subscribe_file_viewer(&viewer, cx);
         self.cached_file_viewers.insert(cache_key, viewer.clone());
@@ -1283,15 +1341,35 @@ impl OverlayManager {
     }
 
     /// Subscribe to a FileViewer's events: Close hides modal (keeps cache),
-    /// Detach moves it to a separate OS window.
+    /// Detach moves it to a separate OS window, OpenCommit bubbles up to RootView.
     fn subscribe_file_viewer(&mut self, viewer: &Entity<FileViewer>, cx: &mut Context<Self>) {
-        cx.subscribe(viewer, |this, _, event: &FileViewerEvent, cx| {
+        cx.subscribe(viewer, |this, viewer_entity, event: &FileViewerEvent, cx| {
             match event {
                 FileViewerEvent::Close => {
                     this.hide_modal(cx);
                 }
                 FileViewerEvent::Detach => {
                     this.detach_active_modal(cx);
+                }
+                FileViewerEvent::OpenCommit(hash) => {
+                    // Look up which project this FileViewer belongs to so the
+                    // host can pick the right GitProvider.
+                    if let Some(project_id) = this
+                        .cached_file_viewers
+                        .iter()
+                        .find(|(_, v)| **v == viewer_entity)
+                        .map(|(k, _)| k.clone())
+                    {
+                        cx.emit(OverlayManagerEvent::OpenCommitFromBlame {
+                            project_id,
+                            hash: hash.clone(),
+                        });
+                    }
+                }
+                FileViewerEvent::BlamePreferenceChanged(visible) => {
+                    crate::settings::settings_entity(cx).update(cx, |state, cx| {
+                        state.set_blame_visible(*visible, cx);
+                    });
                 }
             }
         })

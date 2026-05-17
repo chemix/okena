@@ -253,6 +253,10 @@ pub enum ActionRequest {
         project_id: String,
         file_path: String,
     },
+    GitBlame {
+        project_id: String,
+        relative_path: String,
+    },
     AddProject {
         name: String,
         path: String,
@@ -636,6 +640,10 @@ mod tests {
             ActionRequest::GitDiscardFile {
                 project_id: "p1".into(),
                 file_path: "src/main.rs".into(),
+            },
+            ActionRequest::GitBlame {
+                project_id: "p1".into(),
+                relative_path: "src/main.rs".into(),
             },
             ActionRequest::AddProject {
                 name: "My Project".into(),

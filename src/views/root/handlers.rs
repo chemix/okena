@@ -88,6 +88,29 @@ impl RootView {
             )))
         }
     }
+
+    /// Build a BlameProvider for the given project (local or remote). Returns
+    /// `None` only when project lookup fails — the provider itself surfaces
+    /// non-git / not-tracked errors at call time.
+    pub(super) fn build_blame_provider(
+        &self,
+        project_id: &str,
+        cx: &Context<Self>,
+    ) -> Option<std::sync::Arc<dyn okena_files::blame::BlameProvider>> {
+        let ws = self.workspace.read(cx);
+        let project = ws.project(project_id)?;
+        if project.is_remote {
+            let conn_id = project.connection_id.as_ref()?;
+            let (host, port, token, actual_id) = self.remote_params(project_id, conn_id, cx)?;
+            Some(std::sync::Arc::new(okena_views_git::blame::RemoteBlameProvider::new(
+                host, port, token, actual_id,
+            )))
+        } else {
+            Some(std::sync::Arc::new(okena_views_git::blame::LocalBlameProvider::new(
+                project.path.clone(),
+            )))
+        }
+    }
 }
 
 impl RootView {
@@ -299,6 +322,22 @@ impl RootView {
                     }, cx);
                 }
             }
+            OverlayManagerEvent::OpenCommitFromBlame { project_id, hash } => {
+                if let Some(provider) = self.build_git_provider(project_id, cx) {
+                    let hash = hash.clone();
+                    self.overlay_manager.update(cx, |om, cx| {
+                        om.show_diff_viewer(
+                            provider,
+                            None,
+                            Some(okena_core::types::DiffMode::Commit(hash)),
+                            None,
+                            None,
+                            None,
+                            cx,
+                        );
+                    });
+                }
+            }
             OverlayManagerEvent::RemoteConnected { config } => {
                 if let Some(ref rm) = self.remote_manager {
                     let config_clone = config.clone();
@@ -401,23 +440,26 @@ impl RootView {
                     }
                     ProjectOverlayKind::FileSearch => {
                         if let Some(fs) = self.build_project_fs(&project_id, cx) {
+                            let blame = self.build_blame_provider(&project_id, cx);
                             self.overlay_manager.update(cx, |om, cx| {
-                                om.toggle_file_search(fs, cx);
+                                om.toggle_file_search(fs, blame, cx);
                             });
                         }
                     }
                     ProjectOverlayKind::ContentSearch => {
                         if let Some(fs) = self.build_project_fs(&project_id, cx) {
+                            let blame = self.build_blame_provider(&project_id, cx);
                             let is_dark = crate::theme::theme(cx).is_dark();
                             self.overlay_manager.update(cx, |om, cx| {
-                                om.toggle_content_search(fs, is_dark, cx);
+                                om.toggle_content_search(fs, blame, is_dark, cx);
                             });
                         }
                     }
                     ProjectOverlayKind::FileBrowser => {
                         if let Some(fs) = self.build_project_fs(&project_id, cx) {
+                            let blame = self.build_blame_provider(&project_id, cx);
                             self.overlay_manager.update(cx, |om, cx| {
-                                om.show_file_browser(fs, cx);
+                                om.show_file_browser(fs, blame, cx);
                             });
                         }
                     }
