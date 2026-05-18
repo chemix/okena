@@ -615,16 +615,22 @@ fn collect_tab_terminal_ids(
     }
 }
 
-/// Remove `--profile <value>` and `--profile=<value>` from an args list.
+/// Remove profile-selecting flags so the relaunched process picks them up fresh.
+///
+/// Strips both `--profile` and `--new-profile` (with their values, in either
+/// `--flag value` or `--flag=value` form). If `--new-profile` survived the
+/// relaunch it would re-trigger profile creation each time the user switches
+/// profiles via the GUI, and would also override the `--profile <id>` we
+/// append.
 fn strip_profile_args(args: &mut Vec<String>) {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--profile" {
+        if args[i] == "--profile" || args[i] == "--new-profile" {
             args.remove(i);
             if i < args.len() {
                 args.remove(i);
             }
-        } else if args[i].starts_with("--profile=") {
+        } else if args[i].starts_with("--profile=") || args[i].starts_with("--new-profile=") {
             args.remove(i);
         } else {
             i += 1;
