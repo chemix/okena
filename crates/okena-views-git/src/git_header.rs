@@ -10,6 +10,7 @@ use okena_workspace::request_broker::RequestBroker;
 use okena_workspace::state::Workspace;
 
 use crate::diff_viewer::provider::GitProvider;
+use crate::watcher::GitStatusWatcher;
 
 use gpui::*;
 use std::sync::atomic::AtomicU64;
@@ -58,6 +59,9 @@ pub struct GitHeader {
     request_broker: Entity<RequestBroker>,
     workspace: Entity<Workspace>,
     git_provider: Arc<dyn GitProvider>,
+    /// Optional handle to the centralized git poller, used to trigger an
+    /// immediate refresh after user-initiated branch changes.
+    git_watcher: Option<Entity<GitStatusWatcher>>,
 
     /// Current branch from git watcher (updated externally before rendering).
     current_branch: Option<String>,
@@ -105,6 +109,7 @@ impl GitHeader {
         request_broker: Entity<RequestBroker>,
         workspace: Entity<Workspace>,
         git_provider: Arc<dyn GitProvider>,
+        git_watcher: Option<Entity<GitStatusWatcher>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let branch_picker_filter = cx.new(|cx| {
@@ -120,6 +125,7 @@ impl GitHeader {
             request_broker,
             workspace,
             git_provider,
+            git_watcher,
             current_branch: None,
             diff_popover_visible: false,
             diff_file_summaries: Vec::new(),

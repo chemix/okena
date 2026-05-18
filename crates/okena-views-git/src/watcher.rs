@@ -86,6 +86,62 @@ impl GitStatusWatcher {
         self.statuses.get(project_id).and_then(|s| s.as_ref())
     }
 
+    /// Trigger an immediate git status refresh for a single project, bypassing
+    /// the 5-second polling cadence. Used after explicit user actions like
+    /// branch checkout so the UI reflects the new state without waiting for
+    /// the next poll cycle. PR/CI info is preserved from cache and refreshed
+    /// by the regular loop.
+    pub fn refresh_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        let path = self
+            .workspace
+            .read(cx)
+            .projects()
+            .iter()
+            .find(|p| p.id == project_id && !p.is_remote)
+            .map(|p| p.path.clone());
+        let Some(path) = path else { return };
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let new_status =
+                smol::unblock(move || git::refresh_git_status(Path::new(&path))).await;
+
+            let _ = this.update(cx, |this, cx| {
+                let mut new_status = new_status;
+                if let Some(status) = new_status.as_mut() {
+                    status.pr_info = this.pr_infos.get(&project_id).cloned().flatten();
+                    status.ci_checks = this.ci_checks.get(&project_id).cloned().flatten();
+                }
+
+                let changed = this.statuses.get(&project_id) != Some(&new_status);
+                this.statuses.insert(project_id, new_status);
+
+                if changed {
+                    cx.notify();
+                    let api_statuses: HashMap<String, ApiGitStatus> = this
+                        .statuses
+                        .iter()
+                        .filter_map(|(id, status)| {
+                            status.as_ref().map(|s| {
+                                (
+                                    id.clone(),
+                                    ApiGitStatus {
+                                        branch: s.branch.clone(),
+                                        lines_added: s.lines_added,
+                                        lines_removed: s.lines_removed,
+                                    },
+                                )
+                            })
+                        })
+                        .collect();
+                    this.remote_tx.send_modify(|current| {
+                        *current = api_statuses;
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Spawn the async polling loop.
     fn spawn_refresh(&mut self, cx: &mut Context<Self>) {
         let workspace = self.workspace.clone();
