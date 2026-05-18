@@ -31,10 +31,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::watch as tokio_watch;
 
-/// Push the resolved Claude config directory into the PTY manager as CLAUDE_CONFIG_DIR,
-/// so `claude` invocations inside Okena terminals always read the per-profile account.
-/// Always set unconditionally — per-profile isolation must override any inherited env.
+/// Push the resolved Claude config directory into the PTY manager as CLAUDE_CONFIG_DIR
+/// so `claude` invocations inside Okena terminals read the per-profile account.
+///
+/// Multi-profile users get an unconditional override (otherwise account isolation
+/// would silently break for anyone with `CLAUDE_CONFIG_DIR` exported in their
+/// shell rc). Single-profile users who have explicitly exported the var in their
+/// own environment keep it — there's no profile boundary to enforce.
 fn sync_claude_pty_env(pty_manager: &Arc<PtyManager>, cx: &App) {
+    let multi_profile = okena_core::profiles::all_profiles()
+        .map(|p| p.len() > 1)
+        .unwrap_or(false);
+    if !multi_profile && std::env::var("CLAUDE_CONFIG_DIR").is_ok() {
+        pty_manager.set_extra_env(Vec::new());
+        return;
+    }
+
     let claude_dir = resolve_claude_dir(cx);
     pty_manager.set_extra_env(vec![
         ("CLAUDE_CONFIG_DIR".to_string(), claude_dir.to_string_lossy().into_owned()),
