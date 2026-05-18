@@ -207,7 +207,9 @@ impl GitHeader {
                     })
                     .when_some(
                         project_header::render_ahead_behind_badge(
-                            (status.ahead, status.behind),
+                            status.ahead,
+                            status.behind,
+                            status.unpushed,
                             t,
                         ),
                         |d, badge| d.child(badge),

@@ -72,17 +72,44 @@ pub(crate) fn tint(color: u32, alpha: f32) -> Rgba {
 
 // ── Standalone badges ───────────────────────────────────────────────────────
 
-/// Tooltip text describing ahead/behind counts; `None` when both zero.
-pub fn ahead_behind_tooltip(counts: (Option<usize>, Option<usize>)) -> Option<String> {
-    let ahead = counts.0.unwrap_or(0);
-    let behind = counts.1.unwrap_or(0);
+/// Tooltip text describing ahead/behind/unpushed counts.
+///
+/// `ahead`/`behind` are relative to the upstream tracking branch (which for
+/// worktree branches off `origin/main` may be `origin/main` itself, not the
+/// branch's own remote). `unpushed` counts commits missing from
+/// `origin/<branch>` specifically — `None` when that ref doesn't exist.
+///
+/// Returns `None` when there is nothing meaningful to show.
+pub fn ahead_behind_tooltip(
+    ahead: Option<usize>,
+    behind: Option<usize>,
+    unpushed: Option<usize>,
+) -> Option<String> {
+    let a = ahead.unwrap_or(0);
+    let b = behind.unwrap_or(0);
+    let u = unpushed.unwrap_or(0);
     let plural = |n: usize| if n == 1 { "" } else { "s" };
-    match (ahead, behind) {
-        (0, 0) => None,
-        (a, 0) => Some(format!("{a} commit{} to push", plural(a))),
-        (0, b) => Some(format!("{b} commit{} to pull", plural(b))),
-        (a, b) => Some(format!("{a} to push, {b} to pull")),
+
+    // When unpushed differs from ahead, the branch's upstream isn't its own
+    // remote (typical worktree case). Surface both numbers so the user can
+    // tell "ahead of main" from "not on origin/<branch>".
+    let show_unpushed = unpushed.is_some() && Some(a) != unpushed;
+
+    let mut parts: Vec<String> = Vec::new();
+    if a > 0 {
+        parts.push(format!("{a} commit{} ahead of upstream", plural(a)));
     }
+    if b > 0 {
+        parts.push(format!("{b} commit{} behind upstream", plural(b)));
+    }
+    if show_unpushed {
+        parts.push(format!(
+            "{u} commit{} not pushed to origin/<branch>",
+            plural(u)
+        ));
+    }
+
+    if parts.is_empty() { None } else { Some(parts.join("\n")) }
 }
 
 /// Render a single "<sign> <count>" pair where the sign character is rendered
@@ -103,15 +130,27 @@ fn render_sign_count(sign: &str, count: usize, color: u32, alpha: f32) -> Div {
         )
 }
 
-/// Render an ahead/behind indicator (`↑N ↓M`). Zero-count sides are hidden so
-/// `↑10 ↓0` becomes just `↑10`. Returns `None` when both counts are zero.
+/// Render an ahead/behind/unpushed indicator.
+///
+/// - `↑N` (green) — commits ahead of the upstream tracking branch
+/// - `↓M` (yellow) — commits behind the upstream tracking branch
+/// - `⇡K` (blue, dashed arrow) — commits not on `origin/<branch>`. Only shown
+///   when the count differs from `ahead` (i.e. upstream isn't the branch's
+///   own remote — typical worktree case), so it doesn't double up in the
+///   common case where `↑N` already means "to push".
+///
+/// Zero-count sides are hidden. Returns `None` when nothing is worth showing.
 pub fn render_ahead_behind_badge(
-    counts: (Option<usize>, Option<usize>),
+    ahead: Option<usize>,
+    behind: Option<usize>,
+    unpushed: Option<usize>,
     t: &ThemeColors,
 ) -> Option<AnyElement> {
-    let tooltip_text = ahead_behind_tooltip(counts)?;
-    let ahead = counts.0.unwrap_or(0);
-    let behind = counts.1.unwrap_or(0);
+    let tooltip_text = ahead_behind_tooltip(ahead, behind, unpushed)?;
+    let a = ahead.unwrap_or(0);
+    let b = behind.unwrap_or(0);
+    let u = unpushed.unwrap_or(0);
+    let show_unpushed = unpushed.is_some() && Some(a) != unpushed && u > 0;
 
     Some(
         div()
@@ -120,11 +159,14 @@ pub fn render_ahead_behind_badge(
             .items_center()
             .gap(px(5.0))
             .px(px(3.0))
-            .when(ahead > 0, |d| {
-                d.child(render_sign_count("\u{2191}", ahead, t.term_green, 0.7))
+            .when(a > 0, |d| {
+                d.child(render_sign_count("\u{2191}", a, t.term_green, 0.7))
             })
-            .when(behind > 0, |d| {
-                d.child(render_sign_count("\u{2193}", behind, t.term_yellow, 0.7))
+            .when(b > 0, |d| {
+                d.child(render_sign_count("\u{2193}", b, t.term_yellow, 0.7))
+            })
+            .when(show_unpushed, |d| {
+                d.child(render_sign_count("\u{21E1}", u, t.term_blue, 0.7))
             })
             .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
             .into_any_element(),

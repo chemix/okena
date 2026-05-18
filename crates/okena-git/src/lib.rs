@@ -201,6 +201,14 @@ pub struct GitStatus {
     /// `None` when there is no upstream or HEAD is detached.
     #[serde(default)]
     pub behind: Option<usize>,
+    /// Number of commits not yet pushed to `origin/<branch>`.
+    /// Distinct from `ahead` because a branch's upstream may be `origin/main`
+    /// (worktree branches) — in that case `ahead` counts feature commits vs
+    /// main, while `unpushed` counts only commits missing from the branch's
+    /// own remote ref. `None` when `origin/<branch>` doesn't exist (branch
+    /// was never pushed or remote not configured).
+    #[serde(default)]
+    pub unpushed: Option<usize>,
 }
 
 /// Per-file diff summary for popover display
@@ -337,6 +345,7 @@ pub fn warm_branch_cache(path: &Path) {
             ci_checks: None,
             ahead: None,
             behind: None,
+            unpushed: None,
         }));
     });
 }

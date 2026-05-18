@@ -86,7 +86,7 @@ impl CloseWorktreeDialog {
         let default_branch = main_repo_path
             .as_ref()
             .and_then(|p| git::get_default_branch(&PathBuf::from(p)));
-        let unpushed_count = git::count_unpushed_commits(&path);
+        let unpushed_count = git::count_unpushed_commits(&path).unwrap_or(0);
 
         Self {
             workspace,

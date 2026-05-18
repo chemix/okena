@@ -241,6 +241,7 @@ pub fn get_status(path: &Path) -> StatusFetch {
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
+    let unpushed = count_unpushed_commits(path);
 
     StatusFetch::Status(GitStatus {
         branch,
@@ -250,6 +251,7 @@ pub fn get_status(path: &Path) -> StatusFetch {
         ci_checks: None,
         ahead,
         behind,
+        unpushed,
     })
 }
 
@@ -698,29 +700,24 @@ pub fn count_ahead_behind(path: &Path) -> Option<(usize, usize)> {
 /// Compares against `origin/<branch>` rather than `@{u}` because worktree
 /// branches created from `origin/main` auto-track main, which would
 /// incorrectly report all feature commits as unpushed.
-/// Returns 0 if the branch has never been pushed (no `origin/<branch>` ref).
-pub fn count_unpushed_commits(path: &Path) -> usize {
-    let Some(repo) = crate::gix_helpers::open(path) else {
-        return 0;
-    };
-    let Some(branch) = get_current_branch(path) else {
-        return 0;
-    };
+///
+/// Returns `None` when there is no `origin/<branch>` ref (branch has never
+/// been pushed, or remote not configured). Returns `Some(n)` otherwise —
+/// `Some(0)` means everything is pushed.
+pub fn count_unpushed_commits(path: &Path) -> Option<usize> {
+    let repo = crate::gix_helpers::open(path)?;
+    let branch = get_current_branch(path)?;
 
     let revspec = format!("origin/{}..HEAD", branch);
-    let Ok(spec) = repo.rev_parse(revspec.as_str()) else {
-        return 0;
-    };
+    let spec = repo.rev_parse(revspec.as_str()).ok()?;
 
     let gix::revision::plumbing::Spec::Range { from, to } = spec.detach() else {
-        return 0;
+        return None;
     };
 
-    let Ok(walk) = repo.rev_walk([to]).with_hidden([from]).all() else {
-        return 0;
-    };
+    let walk = repo.rev_walk([to]).with_hidden([from]).all().ok()?;
 
-    walk.filter_map(Result::ok).count()
+    Some(walk.filter_map(Result::ok).count())
 }
 
 /// List all worktrees in a repository (main + linked). Returns vec of
@@ -1425,9 +1422,9 @@ mod tests {
     }
 
     #[test]
-    fn count_unpushed_commits_returns_zero_for_invalid_path() {
+    fn count_unpushed_commits_returns_none_for_invalid_path() {
         let path = PathBuf::from("/nonexistent/path/that/does/not/exist");
-        assert_eq!(count_unpushed_commits(&path), 0);
+        assert_eq!(count_unpushed_commits(&path), None);
     }
 
     #[test]
@@ -1578,10 +1575,10 @@ mod tests {
     }
 
     #[test]
-    fn count_unpushed_returns_zero_when_no_remote() {
+    fn count_unpushed_returns_none_when_no_remote() {
         let (_tmp, repo) = init_temp_repo();
-        // No origin/main exists — should return 0, not error.
-        assert_eq!(count_unpushed_commits(&repo), 0);
+        // No origin/main exists — should return None.
+        assert_eq!(count_unpushed_commits(&repo), None);
     }
 
     #[test]
@@ -1594,7 +1591,7 @@ mod tests {
         git_in(&repo, &["push", "-u", "origin", "main"]);
 
         // No unpushed commits yet.
-        assert_eq!(count_unpushed_commits(&repo), 0);
+        assert_eq!(count_unpushed_commits(&repo), Some(0));
 
         // Add two new commits locally.
         for i in 0..2 {
@@ -1606,7 +1603,7 @@ mod tests {
             );
         }
 
-        assert_eq!(count_unpushed_commits(&repo), 2);
+        assert_eq!(count_unpushed_commits(&repo), Some(2));
     }
 
     #[test]

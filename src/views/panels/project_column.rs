@@ -365,6 +365,7 @@ impl ProjectColumn {
                         ci_checks: None,
                         ahead: None,
                         behind: None,
+                        unpushed: None,
                     })
             });
 
