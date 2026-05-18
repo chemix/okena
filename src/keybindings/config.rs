@@ -307,8 +307,8 @@ impl KeybindingConfig {
         bindings.insert(
             "ShowBranchSwitcher".to_string(),
             vec![
-                KeybindingEntry::new("cmd-shift-b", None),
-                KeybindingEntry::new("ctrl-shift-b", None),
+                KeybindingEntry::new("cmd-alt-b", None),
+                KeybindingEntry::new("ctrl-alt-b", None),
             ],
         );
 

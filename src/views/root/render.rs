@@ -549,7 +549,7 @@ impl Render for RootView {
                     }
                 }
             }))
-            // Handle show branch switcher action (cmd-shift-b)
+            // Handle show branch switcher action (cmd-alt-b)
             .on_action(cx.listener(|this, _: &ShowBranchSwitcher, window, cx| {
                 // Resolve the project that owns the focused terminal (falls
                 // back to the explicitly-focused project for projects without
