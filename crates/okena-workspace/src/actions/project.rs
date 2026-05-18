@@ -9,6 +9,33 @@ use crate::state::{LayoutNode, ProjectData, Workspace};
 use gpui::*;
 use std::collections::HashMap;
 
+/// Pick a replacement focus target after hiding `hidden_id`.
+///
+/// Walks `visible_before` starting from the hidden project's position to find
+/// the closest project that is still visible — preferring the next sibling,
+/// then falling back to the previous one.
+fn pick_focus_replacement(
+    visible_before: &[String],
+    visible_after: &[String],
+    hidden_id: &str,
+) -> Option<String> {
+    let idx = visible_before.iter().position(|id| id == hidden_id)?;
+    let after_set: std::collections::HashSet<&str> =
+        visible_after.iter().map(|s| s.as_str()).collect();
+    visible_before
+        .iter()
+        .skip(idx + 1)
+        .find(|id| after_set.contains(id.as_str()))
+        .or_else(|| {
+            visible_before
+                .iter()
+                .take(idx)
+                .rev()
+                .find(|id| after_set.contains(id.as_str()))
+        })
+        .cloned()
+}
+
 /// Expand `~` or `~/...` at the start of a path to the user's home directory.
 /// Does not expand `~user/...` syntax (other user's home directories).
 fn expand_tilde(path: &str) -> String {
@@ -35,10 +62,38 @@ impl Workspace {
         let new_visible = self.project(project_id).map(|p| !p.show_in_overview);
         let Some(new_visible) = new_visible else { return };
 
+        // When hiding the project that owns the currently focused terminal,
+        // capture the ordered visible list so we can pick a neighbor to focus
+        // after the toggle. Otherwise keyboard shortcuts stop working because
+        // focus points at a column that's no longer rendered.
+        let needs_focus_redirect = !new_visible
+            && self
+                .focus_manager
+                .focused_terminal_state()
+                .map(|s| s.project_id)
+                .as_deref()
+                == Some(project_id);
+        let visible_before: Vec<String> = if needs_focus_redirect {
+            self.visible_projects().iter().map(|p| p.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
         self.with_project(project_id, cx, |project| {
             project.show_in_overview = new_visible;
             true
         });
+
+        if needs_focus_redirect {
+            let visible_after: Vec<String> =
+                self.visible_projects().iter().map(|p| p.id.clone()).collect();
+            let replacement = pick_focus_replacement(&visible_before, &visible_after, project_id);
+            match replacement {
+                Some(next_id) => self.focus_first_terminal_in(&next_id),
+                None => self.focus_manager.clear_focus(),
+            }
+            cx.notify();
+        }
     }
 
     /// Add a new project
@@ -714,7 +769,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_tilde;
+    use super::{expand_tilde, pick_focus_replacement};
     use crate::state::*;
     use crate::settings::HooksConfig;
     use okena_core::theme::FolderColor;
@@ -825,6 +880,46 @@ mod tests {
     fn test_expand_tilde_other_user_unchanged() {
         let result = expand_tilde("~otheruser/path");
         assert_eq!(result, "~otheruser/path");
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn pick_focus_replacement_prefers_next() {
+        let before = s(&["a", "b", "c", "d"]);
+        let after = s(&["a", "b", "d"]);
+        assert_eq!(pick_focus_replacement(&before, &after, "c").as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn pick_focus_replacement_falls_back_to_previous() {
+        let before = s(&["a", "b", "c"]);
+        let after = s(&["a", "b"]);
+        assert_eq!(pick_focus_replacement(&before, &after, "c").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn pick_focus_replacement_skips_other_hidden_neighbors() {
+        // Hiding "b" while "c" is also no longer visible should jump to "d".
+        let before = s(&["a", "b", "c", "d"]);
+        let after = s(&["a", "d"]);
+        assert_eq!(pick_focus_replacement(&before, &after, "b").as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn pick_focus_replacement_none_when_alone() {
+        let before = s(&["a"]);
+        let after: Vec<String> = Vec::new();
+        assert_eq!(pick_focus_replacement(&before, &after, "a"), None);
+    }
+
+    #[test]
+    fn pick_focus_replacement_none_when_id_missing() {
+        let before = s(&["a", "b"]);
+        let after = s(&["a", "b"]);
+        assert_eq!(pick_focus_replacement(&before, &after, "missing"), None);
     }
 }
 
@@ -1003,6 +1098,60 @@ mod gpui_tests {
         workspace.read_with(cx, |ws: &Workspace, _cx| {
             let parent = ws.project("parent").unwrap();
             assert_eq!(parent.worktree_ids, vec!["wt3", "wt1", "wt2"]);
+        });
+    }
+
+    #[gpui::test]
+    fn test_hide_focused_project_moves_focus_to_next(cx: &mut gpui::TestAppContext) {
+        let mut data = make_workspace_data();
+        data.projects = vec![make_project("p1"), make_project("p2"), make_project("p3")];
+        data.project_order = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
+        let workspace = cx.new(|_cx| Workspace::new(data));
+
+        workspace.update(cx, |ws: &mut Workspace, cx| {
+            ws.set_focused_terminal("p2".to_string(), vec![], cx);
+            ws.toggle_project_overview_visibility("p2", cx);
+        });
+
+        workspace.read_with(cx, |ws: &Workspace, _cx| {
+            let state = ws.focus_manager.focused_terminal_state().expect("focus should be set");
+            assert_eq!(state.project_id, "p3");
+        });
+    }
+
+    #[gpui::test]
+    fn test_hide_focused_last_project_falls_back_to_previous(cx: &mut gpui::TestAppContext) {
+        let mut data = make_workspace_data();
+        data.projects = vec![make_project("p1"), make_project("p2")];
+        data.project_order = vec!["p1".to_string(), "p2".to_string()];
+        let workspace = cx.new(|_cx| Workspace::new(data));
+
+        workspace.update(cx, |ws: &mut Workspace, cx| {
+            ws.set_focused_terminal("p2".to_string(), vec![], cx);
+            ws.toggle_project_overview_visibility("p2", cx);
+        });
+
+        workspace.read_with(cx, |ws: &Workspace, _cx| {
+            let state = ws.focus_manager.focused_terminal_state().expect("focus should be set");
+            assert_eq!(state.project_id, "p1");
+        });
+    }
+
+    #[gpui::test]
+    fn test_hide_unfocused_project_leaves_focus(cx: &mut gpui::TestAppContext) {
+        let mut data = make_workspace_data();
+        data.projects = vec![make_project("p1"), make_project("p2")];
+        data.project_order = vec!["p1".to_string(), "p2".to_string()];
+        let workspace = cx.new(|_cx| Workspace::new(data));
+
+        workspace.update(cx, |ws: &mut Workspace, cx| {
+            ws.set_focused_terminal("p1".to_string(), vec![], cx);
+            ws.toggle_project_overview_visibility("p2", cx);
+        });
+
+        workspace.read_with(cx, |ws: &Workspace, _cx| {
+            let state = ws.focus_manager.focused_terminal_state().expect("focus should remain");
+            assert_eq!(state.project_id, "p1");
         });
     }
 
