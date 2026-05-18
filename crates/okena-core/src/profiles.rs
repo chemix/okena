@@ -456,19 +456,23 @@ fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        // Use WaitForSingleObject with a 0 timeout rather than
+        // GetExitCodeProcess + STILL_ACTIVE: a process that legitimately exited
+        // with code 259 (== STILL_ACTIVE) would otherwise be reported alive
+        // forever (or until its PID is reused). The process handle is signaled
+        // once the process terminates; WAIT_TIMEOUT means it is still running.
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
         };
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
             if handle.is_null() {
                 return false;
             }
-            let mut code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut code) != 0;
+            let result = WaitForSingleObject(handle, 0);
             CloseHandle(handle);
-            ok && code == STILL_ACTIVE as u32
+            result == WAIT_TIMEOUT
         }
     }
     #[cfg(not(any(unix, windows)))]
