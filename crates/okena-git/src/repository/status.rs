@@ -85,11 +85,29 @@ pub fn get_current_branch(path: &Path) -> Option<String> {
 }
 
 /// Get the full 40-character SHA of HEAD, or `None` if not a git repo or HEAD
-/// has no commits yet. Used for branch-level CI lookups via the GitHub REST
-/// API (`/commits/{sha}/check-runs` and `/status`).
+/// has no commits yet.
 pub fn get_head_sha(path: &Path) -> Option<String> {
     let repo = crate::gix_helpers::open(path)?;
     let id = repo.head_id().ok()?;
+    Some(id.to_hex().to_string())
+}
+
+/// Full SHA of the current branch's upstream tracking commit — the last commit
+/// known (from the latest fetch) to be on the remote. `None` if HEAD is
+/// detached or the branch has no upstream (never pushed).
+///
+/// Branch-level CI lookups (`/commits/{sha}/check-runs` and `/status`) must use
+/// this rather than the local HEAD: GitHub runs CI against *pushed* commits, so
+/// querying an unpushed local HEAD just returns nothing.
+pub fn get_pushed_sha(path: &Path) -> Option<String> {
+    let repo = crate::gix_helpers::open(path)?;
+    let branch = super::head_branch_short(&repo)?;
+    let head_ref = repo.find_reference(&format!("refs/heads/{}", branch)).ok()?;
+    let head_full: gix::refs::FullName = head_ref.name().into();
+    let upstream_name = repo
+        .branch_remote_tracking_ref_name(head_full.as_ref(), gix::remote::Direction::Fetch)?
+        .ok()?;
+    let id = repo.rev_parse_single(upstream_name.as_bstr()).ok()?.detach();
     Some(id.to_hex().to_string())
 }
 
@@ -560,3 +578,4 @@ mod tests {
         assert_eq!(get_diff_stats(&repo), Some((0, 0)));
     }
 }
+

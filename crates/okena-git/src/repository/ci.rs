@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use okena_core::process::{command, safe_output_with_timeout};
 
-use super::status::get_head_sha;
+use super::status::get_pushed_sha;
 
 /// Hard cap on every `gh` invocation. `gh` can hang indefinitely — auth
 /// prompts, a stalled network, or `--paginate` chasing Link headers — and the
@@ -257,13 +257,17 @@ fn get_pr_ci_checks(path: &Path, pr_number: u32) -> Option<crate::CiCheckSummary
     parse_ci_checks(stdout.trim())
 }
 
-/// Fetch CI checks for the current branch's HEAD commit via the REST API.
+/// Fetch CI checks for the branch's last *pushed* commit via the REST API.
 /// Combines GitHub Actions check-runs with the older commit-status API
 /// (which is what services like Vercel, CircleCI deploy bots, etc. still
 /// use) into a single `CiCheckSummary`.
+///
+/// Uses the upstream (pushed) SHA, not the local HEAD: CI runs on what's on the
+/// remote, so an unpushed local commit has no checks. Returns `None` (skipping
+/// the API calls) when the branch has no upstream — nothing has been pushed.
 fn get_branch_ci_checks(path: &Path) -> Option<crate::CiCheckSummary> {
     let path_str = path.to_str()?;
-    let sha = get_head_sha(path)?;
+    let sha = get_pushed_sha(path)?;
 
     // `gh api` substitutes `{owner}` and `{repo}` from the current repo
     // context, so we don't need to resolve the remote ourselves.
