@@ -403,7 +403,12 @@ impl CommandBus {
         if let Some(scope) = spec.scope
             && let Ok(mut scopes) = self.scopes.lock()
         {
-            scopes.entry(scope).or_default().push(Arc::downgrade(&ctl));
+            let controls = scopes.entry(scope).or_default();
+            // Prune handles for jobs that have already completed (their JobControl
+            // Arc was dropped). Without this the vec — and the scope key — would
+            // grow unbounded for a long-lived scope that's never cancelled.
+            controls.retain(|w| w.strong_count() > 0);
+            controls.push(Arc::downgrade(&ctl));
         }
 
         // Bounded oneshot: capacity 1 so the worker never blocks delivering the
