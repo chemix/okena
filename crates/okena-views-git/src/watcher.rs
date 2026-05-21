@@ -233,13 +233,19 @@ impl GitStatusWatcher {
                         .collect()
                 });
 
-                let check_prs = cycle.is_multiple_of(PR_POLL_EVERY_N_CYCLES);
+                // Skip the cycle-0 `gh` fan-out: at startup the app is already
+                // busy spawning terminals/hooks, and git status (phase 1, gix)
+                // renders immediately regardless. PR/CI kick in on cycle 1 (+5s)
+                // and then follow their normal cadence — so the badges fill in
+                // shortly after launch without a thundering herd of `gh` at the
+                // worst moment.
                 let ci_poll_interval = if this.update(cx, |this, _| this.any_pending_ci).unwrap_or(false) {
                     CI_PENDING_POLL_EVERY_N_CYCLES
                 } else {
                     CI_SETTLED_POLL_EVERY_N_CYCLES
                 };
-                let check_ci = cycle.is_multiple_of(ci_poll_interval);
+                let check_prs = cycle == 1 || (cycle != 0 && cycle.is_multiple_of(PR_POLL_EVERY_N_CYCLES));
+                let check_ci = cycle == 1 || (cycle != 0 && cycle.is_multiple_of(ci_poll_interval));
 
                 // Phase 1: Fetch git status for all projects in parallel
                 let status_futures: Vec<_> = projects.iter().map(|(id, path)| {
@@ -283,7 +289,13 @@ impl GitStatusWatcher {
                         let path = path.clone();
                         async move {
                             let pr_info = smol::unblock(move || {
-                                with_lane(Lane::Poll, || git::repository::get_pr_info(Path::new(&path)))
+                                with_lane(Lane::Poll, || {
+                                    // Skip `gh` entirely for non-GitHub repos.
+                                    if !git::repository::has_github_remote(Path::new(&path)) {
+                                        return None;
+                                    }
+                                    git::repository::get_pr_info(Path::new(&path))
+                                })
                             }).await;
                             (id, pr_info)
                         }
@@ -308,10 +320,16 @@ impl GitStatusWatcher {
                         .map(|(id, path)| {
                             let id = id.clone();
                             let path = path.clone();
-                            let has_pr = pr_infos_snapshot.get(&id).map(|p| p.is_some()).unwrap_or(false);
+                            let pr_number = pr_infos_snapshot.get(&id).and_then(|p| p.as_ref()).map(|p| p.number);
                             async move {
                                 let checks = smol::unblock(move || {
-                                    with_lane(Lane::Poll, || git::repository::get_ci_checks(Path::new(&path), has_pr))
+                                    with_lane(Lane::Poll, || {
+                                        // Skip `gh` entirely for non-GitHub repos.
+                                        if !git::repository::has_github_remote(Path::new(&path)) {
+                                            return None;
+                                        }
+                                        git::repository::get_ci_checks(Path::new(&path), pr_number)
+                                    })
                                 }).await;
                                 (id, checks)
                             }

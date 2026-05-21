@@ -17,14 +17,52 @@ use super::status::get_head_sha;
 /// elapses so one stuck repo can never wedge the git-status loop.
 const GH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Whether the repo has any remote pointing at github.com (https or ssh).
+///
+/// Used to gate `gh` PR/CI polling: repos with no GitHub remote (local-only,
+/// GitLab, Bitbucket, …) can never have GitHub PRs/checks, so every `gh` call
+/// for them just fails after a round-trip. Skipping them is the bulk of the
+/// poller's `gh` fan-out on a machine with many non-GitHub projects.
+pub fn has_github_remote(path: &Path) -> bool {
+    let Some(repo) = crate::gix_helpers::open(path) else {
+        return false;
+    };
+    let names = repo.remote_names();
+    for name in names.iter() {
+        let Ok(remote) = repo.find_remote(name.as_ref()) else {
+            continue;
+        };
+        for dir in [gix::remote::Direction::Fetch, gix::remote::Direction::Push] {
+            if let Some(host) = remote.url(dir).and_then(|u| u.host())
+                && (host == "github.com" || host.ends_with(".github.com"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Get PR info for the current branch (if any PR exists).
-/// Uses `gh pr view` which requires the GitHub CLI to be installed and authenticated.
+/// Requires the GitHub CLI to be installed and authenticated.
+///
+/// Uses `gh pr list --head <branch>` rather than `gh pr view`: the latter
+/// derives the PR's head repository from the branch's tracking remote, so on
+/// repos where `origin` points at a different fork than where the PR actually
+/// lives (a fork/upstream split) it reports "no pull requests found" even when
+/// a PR exists. `gh pr list --head` matches by head branch name in the default
+/// repo, which resolves correctly in that setup.
 pub fn get_pr_info(path: &Path) -> Option<crate::PrInfo> {
     let path_str = path.to_str()?;
+    let branch = super::status::get_current_branch(path)?;
 
     let output = safe_output_with_timeout(
         command("gh")
-            .args(["pr", "view", "--json", "url,state,isDraft,number", "--jq", "[.url, .state, .isDraft, .number] | @tsv"])
+            .args([
+                "pr", "list", "--head", &branch, "--state", "all", "--limit", "1",
+                "--json", "url,state,isDraft,number",
+                "--jq", ".[0] | [.url, .state, .isDraft, .number] | @tsv",
+            ])
             .current_dir(path_str),
         GH_TIMEOUT,
     )
@@ -176,30 +214,33 @@ pub(crate) fn parse_ci_checks(json_str: &str) -> Option<crate::CiCheckSummary> {
 
 /// Get CI check status for the current branch.
 ///
-/// When `has_pr` is true, uses `gh pr checks` (covers Actions + external
-/// status checks aggregated by the PR). Otherwise falls back to fetching
-/// `check-runs` + `status` on the current HEAD commit via `gh api`, which
-/// works for any pushed branch — including default branches without a PR.
+/// With a known PR number, uses `gh pr checks <number>` (covers Actions +
+/// external status checks aggregated by the PR). Otherwise falls back to
+/// fetching `check-runs` + `status` on the current HEAD commit via `gh api`,
+/// which works for any pushed branch — including default branches without a PR.
 ///
 /// Returns `None` when there are no checks, when `gh` isn't installed /
 /// authenticated, or when the repo has no GitHub remote.
-pub fn get_ci_checks(path: &Path, has_pr: bool) -> Option<crate::CiCheckSummary> {
-    if has_pr {
-        get_pr_ci_checks(path)
-    } else {
-        get_branch_ci_checks(path)
+pub fn get_ci_checks(path: &Path, pr_number: Option<u32>) -> Option<crate::CiCheckSummary> {
+    match pr_number {
+        Some(number) => get_pr_ci_checks(path, number),
+        None => get_branch_ci_checks(path),
     }
 }
 
-/// Fetch CI checks via `gh pr checks` (PR-scoped — see `get_ci_checks`).
-fn get_pr_ci_checks(path: &Path) -> Option<crate::CiCheckSummary> {
+/// Fetch CI checks via `gh pr checks <number>` (PR-scoped — see `get_ci_checks`).
+/// The explicit PR number is passed rather than relying on `gh`'s current-branch
+/// resolution, which (like `gh pr view`) misfires on fork/upstream-split repos.
+fn get_pr_ci_checks(path: &Path, pr_number: u32) -> Option<crate::CiCheckSummary> {
     let path_str = path.to_str()?;
+    let number = pr_number.to_string();
 
     let output = safe_output_with_timeout(
         command("gh")
             .args([
                 "pr",
                 "checks",
+                &number,
                 "--json",
                 "bucket,name,workflow,link,description,startedAt,completedAt",
             ])

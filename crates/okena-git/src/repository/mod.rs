@@ -28,7 +28,7 @@ pub use branch::{
     list_branches_classified, merge_branch, push_branch, rebase_onto, stage_file,
     stash_changes, stash_pop, unstage_file, BranchList,
 };
-pub use ci::{get_ci_checks, get_pr_info};
+pub use ci::{get_ci_checks, get_pr_info, has_github_remote};
 pub use paths::{
     compute_target_paths, get_repo_root, normalize_path, project_path_in_worktree,
     resolve_git_root_and_subdir,
