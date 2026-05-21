@@ -89,6 +89,45 @@ impl GitStatusWatcher {
         self.statuses.get(project_id).and_then(|s| s.as_ref())
     }
 
+    /// Merge freshly-fetched statuses into the cache; on any change, notify
+    /// observers (local UI) and push the slimmed status set to remote clients.
+    /// No-op when nothing changed, so re-committing the same data is cheap.
+    fn commit_statuses(
+        &mut self,
+        new_statuses: &HashMap<String, Option<GitStatus>>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = new_statuses
+            .iter()
+            .any(|(id, s)| self.statuses.get(id) != Some(s));
+        if !changed {
+            return;
+        }
+        for (id, status) in new_statuses {
+            self.statuses.insert(id.clone(), status.clone());
+        }
+        cx.notify();
+        let api_statuses: HashMap<String, ApiGitStatus> = self
+            .statuses
+            .iter()
+            .filter_map(|(id, status)| {
+                status.as_ref().map(|s| {
+                    (
+                        id.clone(),
+                        ApiGitStatus {
+                            branch: s.branch.clone(),
+                            lines_added: s.lines_added,
+                            lines_removed: s.lines_removed,
+                        },
+                    )
+                })
+            })
+            .collect();
+        self.remote_tx.send_modify(|current| {
+            *current = api_statuses;
+        });
+    }
+
     /// Trigger an immediate git status refresh for a single project, bypassing
     /// the 5-second polling cadence. Used after explicit user actions like
     /// branch checkout so the UI reflects the new state without waiting for
@@ -216,6 +255,26 @@ impl GitStatusWatcher {
                 let mut new_statuses: HashMap<String, Option<GitStatus>> =
                     futures::future::join_all(status_futures).await.into_iter().collect();
 
+                // Commit git status NOW, before the slow `gh` PR/CI calls below.
+                // git status comes from gix (fast, in-process); PR/CI come from
+                // `gh` (network, and can hang). Committing here means a stuck
+                // `gh` can never block the branch/diff badge from appearing —
+                // and the poll loop keeps cycling. Inject whatever PR/CI we
+                // already have cached so we don't blank those mid-cycle.
+                let should_continue = this.update(cx, |this, cx| {
+                    for (id, status) in new_statuses.iter_mut() {
+                        if let Some(s) = status.as_mut() {
+                            s.pr_info = this.pr_infos.get(id).cloned().flatten();
+                            s.ci_checks = this.ci_checks.get(id).cloned().flatten();
+                        }
+                    }
+                    this.commit_statuses(&new_statuses, cx);
+                    true
+                }).unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+
                 // Phase 2: Fetch PR info in parallel (slower, network calls) — only on PR poll cycles.
                 // Runs after all statuses are updated so git status isn't delayed by PR checks.
                 let new_pr_infos: HashMap<String, Option<okena_git::PrInfo>> = if check_prs {
@@ -262,7 +321,9 @@ impl GitStatusWatcher {
                     HashMap::new()
                 };
 
-                // Compare and update
+                // Merge freshly-fetched PR/CI into the caches and re-commit the
+                // statuses with that richer data. `commit_statuses` no-ops when
+                // nothing changed since the early commit above.
                 let should_continue = this.update(cx, |this, cx| {
                     // Merge into caches rather than replace: when fullscreen narrows
                     // the visible set to a single project, the un-polled projects
@@ -283,35 +344,13 @@ impl GitStatusWatcher {
 
                     // Inject cached PR info + CI checks into statuses
                     for (id, status) in new_statuses.iter_mut() {
-                        if let Some(Some(status)) = status.as_mut().map(Some) {
+                        if let Some(status) = status.as_mut() {
                             status.pr_info = this.pr_infos.get(id).cloned().flatten();
                             status.ci_checks = this.ci_checks.get(id).cloned().flatten();
                         }
                     }
 
-                    let changed = new_statuses.iter()
-                        .any(|(id, s)| this.statuses.get(id) != Some(s));
-                    for (id, status) in new_statuses {
-                        this.statuses.insert(id, status);
-                    }
-
-                    if changed {
-                        cx.notify();
-
-                        // Push to remote watch channel
-                        let api_statuses: HashMap<String, ApiGitStatus> = this.statuses.iter()
-                            .filter_map(|(id, status)| {
-                                status.as_ref().map(|s| (id.clone(), ApiGitStatus {
-                                    branch: s.branch.clone(),
-                                    lines_added: s.lines_added,
-                                    lines_removed: s.lines_removed,
-                                }))
-                            })
-                            .collect();
-                        this.remote_tx.send_modify(|current| {
-                            *current = api_statuses;
-                        });
-                    }
+                    this.commit_statuses(&new_statuses, cx);
                     true
                 }).unwrap_or(false);
 

@@ -5,20 +5,28 @@
 //! `gh` (PR view / pr checks / api).
 
 use std::path::Path;
+use std::time::Duration;
 
-use okena_core::process::{command, safe_output};
+use okena_core::process::{command, safe_output_with_timeout};
 
 use super::status::get_head_sha;
+
+/// Hard cap on every `gh` invocation. `gh` can hang indefinitely — auth
+/// prompts, a stalled network, or `--paginate` chasing Link headers — and the
+/// poller runs these for every project. The bus kills the process when this
+/// elapses so one stuck repo can never wedge the git-status loop.
+const GH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Get PR info for the current branch (if any PR exists).
 /// Uses `gh pr view` which requires the GitHub CLI to be installed and authenticated.
 pub fn get_pr_info(path: &Path) -> Option<crate::PrInfo> {
     let path_str = path.to_str()?;
 
-    let output = safe_output(
+    let output = safe_output_with_timeout(
         command("gh")
             .args(["pr", "view", "--json", "url,state,isDraft,number", "--jq", "[.url, .state, .isDraft, .number] | @tsv"])
             .current_dir(path_str),
+        GH_TIMEOUT,
     )
     .ok()?;
 
@@ -187,7 +195,7 @@ pub fn get_ci_checks(path: &Path, has_pr: bool) -> Option<crate::CiCheckSummary>
 fn get_pr_ci_checks(path: &Path) -> Option<crate::CiCheckSummary> {
     let path_str = path.to_str()?;
 
-    let output = safe_output(
+    let output = safe_output_with_timeout(
         command("gh")
             .args([
                 "pr",
@@ -196,6 +204,7 @@ fn get_pr_ci_checks(path: &Path) -> Option<crate::CiCheckSummary> {
                 "bucket,name,workflow,link,description,startedAt,completedAt",
             ])
             .current_dir(path_str),
+        GH_TIMEOUT,
     )
     .ok()?;
 
@@ -220,17 +229,19 @@ fn get_branch_ci_checks(path: &Path) -> Option<crate::CiCheckSummary> {
     let check_runs_endpoint = format!("repos/{{owner}}/{{repo}}/commits/{}/check-runs", sha);
     let status_endpoint = format!("repos/{{owner}}/{{repo}}/commits/{}/status", sha);
 
-    let check_runs_out = safe_output(
+    let check_runs_out = safe_output_with_timeout(
         command("gh")
             .args(["api", "--paginate", &check_runs_endpoint])
             .current_dir(path_str),
+        GH_TIMEOUT,
     )
     .ok()?;
 
-    let statuses_out = safe_output(
+    let statuses_out = safe_output_with_timeout(
         command("gh")
             .args(["api", &status_endpoint])
             .current_dir(path_str),
+        GH_TIMEOUT,
     )
     .ok()?;
 
