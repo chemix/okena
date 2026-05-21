@@ -2,6 +2,7 @@ use okena_git::{self as git, GitStatus};
 use okena_workspace::state::Workspace;
 use gpui::prelude::*;
 use gpui::*;
+use futures::StreamExt;
 use okena_core::api::ApiGitStatus;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -16,6 +17,11 @@ const PR_POLL_EVERY_N_CYCLES: u64 = 12;
 const CI_PENDING_POLL_EVERY_N_CYCLES: u64 = 3;
 /// How many git poll cycles between CI check polls when checks are settled (~60s)
 const CI_SETTLED_POLL_EVERY_N_CYCLES: u64 = 12;
+/// Cap on concurrent subprocess spawns per poll phase. Each phase fans out one
+/// task per project (`git diff --numstat`, `gh pr`, `gh check-runs`), and each
+/// spawn briefly holds ~5 FDs. macOS GUI processes get `RLIMIT_NOFILE = 256`
+/// by default — unbounded fan-out across 20+ projects trips `EMFILE`.
+const MAX_CONCURRENT_GIT: usize = 8;
 
 /// Centralized git status poller.
 ///
@@ -74,10 +80,12 @@ impl GitStatusWatcher {
                     .collect()
             });
 
-            let futures = paths.into_iter().map(|path| {
+            futures::stream::iter(paths.into_iter().map(|path| {
                 smol::unblock(move || git::warm_branch_cache(Path::new(&path)))
-            });
-            futures::future::join_all(futures).await;
+            }))
+            .buffer_unordered(MAX_CONCURRENT_GIT)
+            .collect::<Vec<_>>()
+            .await;
         }).detach();
     }
 
@@ -198,24 +206,30 @@ impl GitStatusWatcher {
                 };
                 let check_ci = cycle % ci_poll_interval == 0;
 
-                // Phase 1: Fetch git status for all projects in parallel
-                let status_futures: Vec<_> = projects.iter().map(|(id, path)| {
-                    let id = id.clone();
-                    let path = path.clone();
-                    async move {
-                        let status = smol::unblock(move || {
-                            git::refresh_git_status(Path::new(&path))
-                        }).await;
-                        (id, status)
-                    }
-                }).collect();
+                // Phase 1: Fetch git status for all projects, bounded so the
+                // burst of `git diff --numstat` spawns can't exhaust the
+                // process FD limit (see MAX_CONCURRENT_GIT).
                 let mut new_statuses: HashMap<String, Option<GitStatus>> =
-                    futures::future::join_all(status_futures).await.into_iter().collect();
+                    futures::stream::iter(projects.iter().map(|(id, path)| {
+                        let id = id.clone();
+                        let path = path.clone();
+                        async move {
+                            let status = smol::unblock(move || {
+                                git::refresh_git_status(Path::new(&path))
+                            }).await;
+                            (id, status)
+                        }
+                    }))
+                    .buffer_unordered(MAX_CONCURRENT_GIT)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect();
 
                 // Phase 2: Fetch PR info in parallel (slower, network calls) — only on PR poll cycles.
                 // Runs after all statuses are updated so git status isn't delayed by PR checks.
                 let new_pr_infos: HashMap<String, Option<okena_git::PrInfo>> = if check_prs {
-                    let pr_futures: Vec<_> = projects.iter().map(|(id, path)| {
+                    futures::stream::iter(projects.iter().map(|(id, path)| {
                         let id = id.clone();
                         let path = path.clone();
                         async move {
@@ -224,8 +238,12 @@ impl GitStatusWatcher {
                             }).await;
                             (id, pr_info)
                         }
-                    }).collect();
-                    futures::future::join_all(pr_futures).await.into_iter().collect()
+                    }))
+                    .buffer_unordered(MAX_CONCURRENT_GIT)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect()
                 } else {
                     HashMap::new()
                 };
@@ -241,19 +259,22 @@ impl GitStatusWatcher {
                         // Use cached PR info
                         this.update(cx, |this, _| this.pr_infos.clone()).unwrap_or_default()
                     };
-                    let ci_futures: Vec<_> = projects.iter()
-                        .map(|(id, path)| {
-                            let id = id.clone();
-                            let path = path.clone();
-                            let has_pr = pr_infos_snapshot.get(&id).map(|p| p.is_some()).unwrap_or(false);
-                            async move {
-                                let checks = smol::unblock(move || {
-                                    git::repository::get_ci_checks(Path::new(&path), has_pr)
-                                }).await;
-                                (id, checks)
-                            }
-                        }).collect();
-                    futures::future::join_all(ci_futures).await.into_iter().collect()
+                    futures::stream::iter(projects.iter().map(|(id, path)| {
+                        let id = id.clone();
+                        let path = path.clone();
+                        let has_pr = pr_infos_snapshot.get(&id).map(|p| p.is_some()).unwrap_or(false);
+                        async move {
+                            let checks = smol::unblock(move || {
+                                git::repository::get_ci_checks(Path::new(&path), has_pr)
+                            }).await;
+                            (id, checks)
+                        }
+                    }))
+                    .buffer_unordered(MAX_CONCURRENT_GIT)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect()
                 } else {
                     HashMap::new()
                 };
@@ -279,7 +300,7 @@ impl GitStatusWatcher {
 
                     // Inject cached PR info + CI checks into statuses
                     for (id, status) in new_statuses.iter_mut() {
-                        if let Some(Some(status)) = status.as_mut().map(Some) {
+                        if let Some(status) = status.as_mut() {
                             status.pr_info = this.pr_infos.get(id).cloned().flatten();
                             status.ci_checks = this.ci_checks.get(id).cloned().flatten();
                         }
