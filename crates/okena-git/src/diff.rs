@@ -555,31 +555,33 @@ pub fn is_git_repo(path: &Path) -> bool {
 ///
 /// - `revision` can be "HEAD", a commit hash, or empty for the index (staged version)
 pub fn get_file_from_git(repo_path: &Path, revision: &str, file_path: &str) -> Option<String> {
-    let repo_str = repo_path.to_str()?;
+    let repo = crate::gix_helpers::open(repo_path)?;
 
-    // Validate revision to prevent flag injection (empty is ok — means index)
-    if !revision.is_empty() {
-        crate::validate_git_ref(revision).ok()?;
-    }
-
-    // Format: revision:path (e.g., "HEAD:src/main.rs")
-    // For index, use ":0:path" syntax (stage 0 = normal index entry)
-    let object = if revision.is_empty() {
-        format!(":0:{}", file_path)
+    let data = if revision.is_empty() {
+        // Empty revision → stage-0 (staged) version from the index.
+        let index = repo.open_index().ok()?;
+        let id = index
+            .entry_by_path(gix::bstr::BStr::new(file_path.as_bytes()))?
+            .id;
+        repo.find_object(id).ok()?.data.clone()
     } else {
-        format!("{}:{}", revision, file_path)
+        // Validate to reject flag injection, then resolve <rev> → tree → blob.
+        crate::validate_git_ref(revision).ok()?;
+        let tree = repo
+            .rev_parse_single(revision)
+            .ok()?
+            .object()
+            .ok()?
+            .peel_to_tree()
+            .ok()?;
+        let entry = tree.lookup_entry_by_path(file_path).ok()??;
+        if !entry.mode().is_blob() {
+            return None;
+        }
+        entry.object().ok()?.data.clone()
     };
 
-    let output = safe_output(
-        command("git").args(["-C", repo_str, "show", &object]),
-    )
-    .ok()?;
-
-    if output.status.success() {
-        String::from_utf8(output.stdout).ok()
-    } else {
-        None
-    }
+    String::from_utf8(data).ok()
 }
 
 /// Safely join a file path to a repo root, rejecting path traversal attempts.
@@ -649,6 +651,24 @@ pub fn get_file_contents_for_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_file_from_git_reads_head_and_staged_versions() {
+        use crate::repository::test_support::{git_in, init_temp_repo};
+
+        // init_temp_repo commits file.txt = "x".
+        let (_tmp, repo) = init_temp_repo();
+        assert_eq!(get_file_from_git(&repo, "HEAD", "file.txt").as_deref(), Some("x"));
+
+        // Stage a modified version: HEAD stays "x", the index becomes "y".
+        std::fs::write(repo.join("file.txt"), "y").unwrap();
+        git_in(&repo, &["add", "file.txt"]);
+        assert_eq!(get_file_from_git(&repo, "HEAD", "file.txt").as_deref(), Some("x"));
+        assert_eq!(get_file_from_git(&repo, "", "file.txt").as_deref(), Some("y"));
+
+        // Missing path resolves to nothing rather than erroring.
+        assert!(get_file_from_git(&repo, "HEAD", "nope.txt").is_none());
+    }
 
     #[test]
     fn test_parse_hunk_header() {

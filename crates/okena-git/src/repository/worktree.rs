@@ -1,6 +1,6 @@
 //! Worktree operations: create / remove / list / clean stale dirs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use okena_core::process::{command, safe_output};
 
@@ -8,6 +8,35 @@ use super::branch::get_default_branch;
 use super::paths::normalize_path;
 use super::{head_branch_short, path_str, require_success};
 use crate::error::{GitError, GitResult};
+
+/// Collect the work-directory paths of every active worktree (main + linked),
+/// including detached ones — unlike `list_git_worktrees`, which skips detached
+/// heads. Best-effort: returns an empty vec if the repo can't be opened.
+fn active_worktree_paths(repo_path: &Path) -> Vec<PathBuf> {
+    let Some(repo) = crate::gix_helpers::open(repo_path) else {
+        return Vec::new();
+    };
+
+    let mut paths = Vec::new();
+
+    // Main worktree, resolved via common_dir so this works from a linked worktree.
+    if let Ok(main_repo) = gix::open(repo.common_dir())
+        && let Some(workdir) = main_repo.workdir() {
+            paths.push(workdir.to_path_buf());
+        }
+
+    // Linked worktrees from .git/worktrees/*; base() resolves even if the
+    // worktree directory is currently inaccessible.
+    if let Ok(worktrees) = repo.worktrees() {
+        for proxy in worktrees {
+            if let Ok(base) = proxy.base() {
+                paths.push(base);
+            }
+        }
+    }
+
+    paths
+}
 
 /// If `target_path` exists but is NOT a currently registered worktree, remove
 /// the stale directory and prune worktree metadata so a fresh `worktree add`
@@ -17,23 +46,16 @@ fn clean_stale_worktree_dir(repo_path: &Path, target_path: &Path) -> GitResult<(
         return Ok(());
     }
 
-    // Ask git which paths are active worktrees
+    // Ask gix which paths are active worktrees (main + linked, incl. detached).
     let repo_str = path_str(repo_path)?;
-    let output = safe_output(
-        command("git").args(["-C", repo_str, "worktree", "list", "--porcelain"]),
-    )?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let target_normalized = normalize_path(target_path);
-        for line in stdout.lines() {
-            if let Some(wt_path) = line.strip_prefix("worktree ")
-                && normalize_path(Path::new(wt_path)) == target_normalized {
-                    return Err(GitError::WorktreeExists {
-                        path: target_path.to_path_buf(),
-                    });
-                }
-        }
+    let target_normalized = normalize_path(target_path);
+    if active_worktree_paths(repo_path)
+        .iter()
+        .any(|p| normalize_path(p) == target_normalized)
+    {
+        return Err(GitError::WorktreeExists {
+            path: target_path.to_path_buf(),
+        });
     }
 
     // Not an active worktree — remove the stale directory and prune metadata
