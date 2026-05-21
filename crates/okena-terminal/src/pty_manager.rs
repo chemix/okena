@@ -750,6 +750,16 @@ impl PtyManager {
             && let Err(e) = h.join() {
                 log::warn!("PTY reader thread panicked on join: {}", format_panic(&*e));
             }
+
+        // 7. Reap the child to prevent a zombie. The reader normally reaps via
+        //    `wait_for_exit_code` on EOF, but that is a bounded `WNOHANG` poll that
+        //    gives up if the SIGKILL'd child is briefly unreapable (e.g. stuck in
+        //    D-state on slow IO). Now that the reader has joined, a blocking wait
+        //    guarantees the PID is reaped. If the reader already reaped it via raw
+        //    `waitpid`, this just returns ECHILD, which is harmless.
+        if let Err(e) = handle.child.wait() {
+            log::debug!("PTY child {} already reaped or wait failed: {}", id, e);
+        }
     }
 
     /// Detach from all terminals without killing sessions
