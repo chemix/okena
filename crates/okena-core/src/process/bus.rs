@@ -211,8 +211,25 @@ impl CommandSpec {
         }
     }
 
-    fn audit_label(&self) -> &str {
-        self.label.unwrap_or(self.program.as_str())
+    /// Full invocation for the audit log: optional label + program + args
+    /// (+ cwd). Lets a review of `okena::cmd` see exactly what ran, with which
+    /// arguments and in which repo, not just the program name.
+    fn audit_detail(&self) -> String {
+        let mut s = String::new();
+        if let Some(label) = self.label {
+            s.push_str(label);
+            s.push_str(": ");
+        }
+        s.push_str(&self.program);
+        for a in &self.args {
+            s.push(' ');
+            s.push_str(a);
+        }
+        if let Some(cwd) = &self.cwd {
+            use std::fmt::Write as _;
+            let _ = write!(s, " (cwd={})", cwd.display());
+        }
+        s
     }
 
     fn build(&self) -> std::process::Command {
@@ -460,8 +477,8 @@ fn run_job(spec: &CommandSpec, ctl: &Arc<JobControl>) -> std::io::Result<Output>
     }
 
     let started = Instant::now();
-    let label = spec.audit_label();
-    log::trace!(target: "okena::cmd", "[{}] start {}", spec.lane.name(), label);
+    let detail = spec.audit_detail();
+    log::trace!(target: "okena::cmd", "[{}] start {}", spec.lane.name(), detail);
 
     // Catch the rare EBADF panic from std's pipe reader under FD pressure and
     // turn it into a normal error (preserves the old `safe_output` guarantee).
@@ -470,7 +487,7 @@ fn run_job(spec: &CommandSpec, ctl: &Arc<JobControl>) -> std::io::Result<Output>
     }))
     .unwrap_or_else(|panic| {
         let msg = panic_message(&panic);
-        log::error!(target: "okena::cmd", "[{}] {} panicked: {msg}", spec.lane.name(), label);
+        log::error!(target: "okena::cmd", "[{}] {} panicked: {msg}", spec.lane.name(), detail);
         Err(std::io::Error::other(format!("command panicked: {msg}")))
     });
 
@@ -479,12 +496,12 @@ fn run_job(spec: &CommandSpec, ctl: &Arc<JobControl>) -> std::io::Result<Output>
         Ok(out) => log::debug!(
             target: "okena::cmd",
             "[{}] {} -> {} ({elapsed}ms)",
-            spec.lane.name(), label,
+            spec.lane.name(), detail,
             out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
         ),
         Err(e) => log::warn!(
             target: "okena::cmd",
-            "[{}] {} failed: {e} ({elapsed}ms)", spec.lane.name(), label,
+            "[{}] {} failed: {e} ({elapsed}ms)", spec.lane.name(), detail,
         ),
     }
     result

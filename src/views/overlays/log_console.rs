@@ -209,6 +209,17 @@ fn level_label(level: log::Level) -> &'static str {
     }
 }
 
+/// One log line as a plain, paste-friendly string (mirrors the row layout).
+fn format_line_for_copy(line: &LogLine) -> String {
+    format!(
+        "{} {} {} {}",
+        format_time(&line.timestamp),
+        level_label(line.level),
+        line.target,
+        line.message
+    )
+}
+
 fn format_time(ts: &time::OffsetDateTime) -> String {
     format!(
         "{:02}:{:02}:{:02}.{:03}",
@@ -336,6 +347,24 @@ impl LogConsole {
                             this.auto_scroll = !this.auto_scroll;
                             this.pending_scroll = this.auto_scroll;
                             cx.notify();
+                        }),
+                    ))
+                    .child(toggle_chip(
+                        "copy",
+                        false,
+                        t,
+                        cx,
+                        cx.listener(|this, _, _w, cx| {
+                            // Copy exactly what's on screen (respects the active
+                            // filter + severity), so a review can paste the
+                            // relevant slice straight out.
+                            let text = this
+                                .visible()
+                                .iter()
+                                .map(format_line_for_copy)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
                         }),
                     ))
                     .child(toggle_chip(
