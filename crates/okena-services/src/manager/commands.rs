@@ -176,15 +176,24 @@ impl ServiceManager {
                 instance.detected_ports.clear();
                 cx.notify();
 
+                let log_name = name.clone();
                 cx.spawn(async move |_this: WeakEntity<ServiceManager>, cx| {
-                    cx.background_executor()
+                    let result = cx.background_executor()
                         .spawn(async move {
                             let mut cmd = okena_core::process::command("docker");
                             cmd.args(["compose", "-f", &compose_file, "stop", &name])
                                 .current_dir(&path);
-                            let _ = okena_core::process::safe_output(&mut cmd);
+                            okena_core::process::safe_output(&mut cmd)
                         })
                         .await;
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            log::error!("docker compose stop failed for '{}': {}", log_name, stderr.trim());
+                        }
+                        Err(e) => log::error!("docker compose stop failed to run for '{}': {}", log_name, e),
+                        _ => {}
+                    }
                 }).detach();
             }
             ServiceKind::Okena => {
@@ -227,15 +236,24 @@ impl ServiceManager {
                 instance.detected_ports.clear();
                 cx.notify();
 
+                let log_name = name.clone();
                 cx.spawn(async move |this: WeakEntity<ServiceManager>, cx| {
-                    cx.background_executor()
+                    let result = cx.background_executor()
                         .spawn(async move {
                             let mut cmd = okena_core::process::command("docker");
                             cmd.args(["compose", "-f", &compose_file, "restart", &name])
                                 .current_dir(&path);
-                            let _ = okena_core::process::safe_output(&mut cmd);
+                            okena_core::process::safe_output(&mut cmd)
                         })
                         .await;
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            log::error!("docker compose restart failed for '{}': {}", log_name, stderr.trim());
+                        }
+                        Err(e) => log::error!("docker compose restart failed to run for '{}': {}", log_name, e),
+                        _ => {}
+                    }
                     let _ = this.update(cx, |_this, cx| cx.notify());
                 }).detach();
             }
