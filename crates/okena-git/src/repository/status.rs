@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use okena_core::process::{command, safe_output};
+use okena_core::process::command;
 
 use super::path_str;
 use crate::GitStatus;
@@ -11,9 +11,8 @@ use crate::GitStatus;
 ///
 /// Distinguishing "not a repo" from "transient failure" lets the polling
 /// watcher preserve the last known +/- counts instead of clobbering them
-/// with `(0, 0)` whenever `git diff --numstat HEAD` or the gix index walk
-/// briefly fails (lock contention with a concurrent `git add`, partial
-/// `.git/index` rewrite, etc).
+/// with `(0, 0)` whenever the gix status walk briefly fails (lock contention
+/// with a concurrent `git add`, partial `.git/index` rewrite, etc).
 pub enum StatusFetch {
     /// Got a fresh reading.
     Status(GitStatus),
@@ -97,61 +96,91 @@ pub fn get_head_sha(path: &Path) -> Option<String> {
     Some(id.to_hex().to_string())
 }
 
-/// Get diff statistics (lines added, lines removed) for working directory.
+/// Per-file added/removed line counts for every tracked path that differs from
+/// HEAD, returned as `(repo-relative path, added, removed)` — the structured
+/// equivalent of `git diff --numstat --no-renames HEAD`. Untracked files are
+/// *not* included; callers handle those separately. Binary files appear with
+/// `(.., 0, 0)`, matching numstat's `-`/`-`.
 ///
-/// Returns `None` on transient failure (numstat spawn failed, numstat exited
-/// non-zero, or the gix-based untracked walk errored). The polling watcher
-/// uses `None` to keep the last known +/- so a single bad cycle doesn't
-/// blank the badge — see `StatusFetch::Transient`.
+/// Computed entirely in-process via gix — no subprocess spawn. This replaced
+/// the `git diff --numstat HEAD` spawn that was the last one in the 5s
+/// status-poll hot path; under many projects that fan-out tripped the macOS
+/// `RLIMIT_NOFILE` default and blanked status badges (#125).
 ///
-/// Still shells out to `git diff --numstat HEAD`: the gix equivalent would
-/// require a 3-way walk (HEAD tree → index → worktree) plus per-blob line
-/// diffing via imara-diff. This is the last remaining spawn in the polling
-/// hot path; everything else is now gix-native.
-fn get_diff_stats(path: &Path) -> Option<(usize, usize)> {
-    let path_str = path.to_str()?;
+/// Returns `None` on a transient failure (couldn't open the repo, init the
+/// status walk, or an iteration step errored) so the polling watcher can keep
+/// the last known counts — see `StatusFetch::Transient`.
+pub(crate) fn tracked_diff_counts(path: &Path) -> Option<Vec<(String, usize, usize)>> {
+    let repo = crate::gix_helpers::open(path)?;
+    let workdir = repo.workdir()?.to_path_buf();
 
-    let (mut added, mut removed) = (0usize, 0usize);
+    // HEAD tree to diff the worktree against. An unborn HEAD (no commits yet)
+    // leaves this `None`, so every tracked blob diffs against an empty source.
+    let head_tree = repo.head_tree().ok();
 
-    // --no-renames: report renames as a delete of the old path + add of the
-    // new path rather than numstat's `old => new` arrow form. Consistent with
-    // get_diff_file_summary in lib.rs.
-    match safe_output(
-        command("git").args(["-C", path_str, "diff", "--numstat", "--no-renames", "--no-color", "--no-ext-diff", "HEAD"]),
-    ) {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() >= 2 {
-                    // Binary files show "-" instead of numbers
-                    if let Ok(a) = parts[0].parse::<usize>() {
-                        added += a;
-                    }
-                    if let Ok(r) = parts[1].parse::<usize>() {
-                        removed += r;
-                    }
-                }
-            }
+    // One parallel HEAD → index → worktree walk. Rename tracking is disabled to
+    // match `--no-renames`: a rename surfaces as a delete of the old path plus
+    // an add of the new one.
+    let iter = repo
+        .status(gix::progress::Discard)
+        .ok()?
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .into_iter(None)
+        .ok()?;
+
+    // Unique set of tracked paths that differ from HEAD. A path can surface in
+    // both the tree→index and index→worktree phases (staged *and* further
+    // edited); dedup so we count it once. We recompute each path's counts from
+    // HEAD-blob vs worktree-file directly, so the staging split doesn't matter.
+    let mut changed: std::collections::HashSet<gix::bstr::BString> = std::collections::HashSet::new();
+    for item in iter {
+        let item = item.ok()?;
+        // Untracked entries are the callers' separate concern — skip them here.
+        if matches!(
+            item,
+            gix::status::Item::IndexWorktree(gix::status::index_worktree::Item::DirectoryContents { .. })
+        ) {
+            continue;
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::warn!(
-                "git diff --numstat HEAD exited {} for {}: {}",
-                output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into()),
-                path_str,
-                stderr.trim(),
-            );
-            return None;
-        }
-        Err(e) => {
-            log::warn!("git diff --numstat HEAD spawn failed for {}: {e}", path_str);
-            return None;
-        }
+        changed.insert(item.location().to_owned());
     }
 
-    // Also include untracked files (count lines). A None here means the gix
-    // status walk failed transiently — propagate so we don't undercount.
+    let mut counts = Vec::with_capacity(changed.len());
+    for rela in &changed {
+        let rela_bstr = gix::bstr::BStr::new(rela);
+        let rela_path = gix::path::from_bstr(rela_bstr);
+        let name = String::from_utf8_lossy(rela_bstr).into_owned();
+        let head_blob = head_blob_bytes(head_tree.as_ref(), rela_bstr);
+        let wt_bytes = std::fs::read(workdir.join(&rela_path)).unwrap_or_default();
+
+        // Binary files report `-`/`-` (i.e. 0/0) in numstat. Record them with
+        // zero counts rather than diffing — they still belong in per-file lists.
+        if is_binary(&head_blob) || is_binary(&wt_bytes) {
+            counts.push((name, 0, 0));
+            continue;
+        }
+        let (added, removed) = diff_line_counts(&head_blob, &wt_bytes);
+        counts.push((name, added, removed));
+    }
+
+    Some(counts)
+}
+
+/// Get diff statistics (total lines added, lines removed) for the working
+/// directory: tracked changes vs HEAD plus untracked-file line counts.
+///
+/// Returns `None` on a transient failure so the polling watcher keeps the last
+/// known +/- instead of blanking the badge — see `StatusFetch::Transient`.
+fn get_diff_stats(path: &Path) -> Option<(usize, usize)> {
+    let (mut added, mut removed) = (0usize, 0usize);
+    for (_path, a, r) in tracked_diff_counts(path)? {
+        added += a;
+        removed += r;
+    }
+
+    // Untracked files: count each line as an addition. A None here means the
+    // gix status walk failed transiently — propagate so we don't undercount.
     let untracked = crate::gix_helpers::list_untracked_files(path)?;
     for file in untracked {
         let file_path = path.join(&file);
@@ -161,6 +190,37 @@ fn get_diff_stats(path: &Path) -> Option<(usize, usize)> {
     }
 
     Some((added, removed))
+}
+
+/// Read the bytes of `rela_path`'s blob in the HEAD tree. Returns empty when
+/// HEAD is unborn, the path isn't in HEAD (freshly added), or it isn't a
+/// regular blob (submodule/gitlink) — all of which diff as "no prior content".
+fn head_blob_bytes(head_tree: Option<&gix::Tree<'_>>, rela_path: &gix::bstr::BStr) -> Vec<u8> {
+    let Some(tree) = head_tree else {
+        return Vec::new();
+    };
+    let path = gix::path::from_bstr(rela_path);
+    match tree.lookup_entry_by_path(path.as_ref()) {
+        Ok(Some(entry)) if entry.mode().is_blob() => entry.object().map(|o| o.data.clone()).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Count added/removed lines between two blob versions using imara-diff (pulled
+/// in via gix's `blame` feature), with Git's slider heuristics so hunk
+/// placement — and therefore the counts — match `git diff --numstat`.
+fn diff_line_counts(before: &[u8], after: &[u8]) -> (usize, usize) {
+    use gix::diff::blob::{diff_with_slider_heuristics, sources::byte_lines, Algorithm, InternedInput};
+
+    let input = InternedInput::new(byte_lines(before), byte_lines(after));
+    let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
+    (diff.count_additions() as usize, diff.count_removals() as usize)
+}
+
+/// Git treats a blob as binary if a NUL byte appears near the start; such files
+/// report `-` in numstat and contribute nothing to the +/- totals.
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|&b| b == 0)
 }
 
 /// Count commits the local branch is ahead of / behind its upstream.
@@ -397,5 +457,111 @@ mod tests {
         // Short hash from gix has at least 7 chars and is hex
         assert!(branch.len() >= 7, "expected short hash, got {:?}", branch);
         assert!(branch.chars().all(|c| c.is_ascii_hexdigit()), "expected hex hash, got {:?}", branch);
+    }
+
+    #[test]
+    fn diff_stats_clean_repo_is_zero() {
+        let (_tmp, repo) = init_temp_repo();
+        assert_eq!(get_diff_stats(&repo), Some((0, 0)));
+    }
+
+    #[test]
+    fn diff_stats_counts_modified_tracked_file() {
+        let (_tmp, repo) = init_temp_repo();
+        // init_temp_repo commits file.txt == "x" (one line, no newline).
+        std::fs::write(repo.join("file.txt"), "a\nb\nc\n").unwrap();
+        // Full replacement of the single old line by three new ones.
+        assert_eq!(get_diff_stats(&repo), Some((3, 1)));
+    }
+
+    #[test]
+    fn diff_stats_dedups_staged_and_reworked_file() {
+        let (_tmp, repo) = init_temp_repo();
+        // Stage one version, then edit the worktree again. The path shows up in
+        // both the tree→index and index→worktree phases; it must be counted
+        // once, computed from HEAD ("x") vs the live worktree.
+        std::fs::write(repo.join("file.txt"), "a\nb\n").unwrap();
+        git_in(&repo, &["add", "file.txt"]);
+        std::fs::write(repo.join("file.txt"), "a\nb\nc\n").unwrap();
+        assert_eq!(get_diff_stats(&repo), Some((3, 1)));
+    }
+
+    #[test]
+    fn diff_stats_counts_deleted_file_as_removals() {
+        let (_tmp, repo) = init_temp_repo();
+        std::fs::remove_file(repo.join("file.txt")).unwrap();
+        // The one committed line is gone, nothing added.
+        assert_eq!(get_diff_stats(&repo), Some((0, 1)));
+    }
+
+    #[test]
+    fn diff_stats_counts_staged_new_file_once() {
+        let (_tmp, repo) = init_temp_repo();
+        // A staged-but-uncommitted new file is tracked (in the index), so it
+        // must be counted via the tree→index walk, not double-counted as
+        // untracked.
+        std::fs::write(repo.join("added.txt"), "l1\nl2\n").unwrap();
+        git_in(&repo, &["add", "added.txt"]);
+        assert_eq!(get_diff_stats(&repo), Some((2, 0)));
+    }
+
+    #[test]
+    fn diff_stats_treats_rename_as_delete_plus_add() {
+        let (_tmp, repo) = init_temp_repo();
+        std::fs::write(repo.join("orig.txt"), "l1\nl2\nl3\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["-c", "commit.gpgsign=false", "commit", "-m", "add orig"]);
+        git_in(&repo, &["mv", "orig.txt", "renamed.txt"]);
+        // --no-renames semantics: 3 lines removed from orig + 3 added to renamed.
+        assert_eq!(get_diff_stats(&repo), Some((3, 3)));
+    }
+
+    #[test]
+    fn diff_stats_matches_git_cli_numstat() {
+        let (_tmp, repo) = init_temp_repo();
+        // A mixed bag: modify a tracked file, add+commit then edit another,
+        // delete one, stage a new file, leave one untracked.
+        std::fs::write(repo.join("file.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        std::fs::write(repo.join("keep.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        std::fs::write(repo.join("doomed.txt"), "x\ny\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["-c", "commit.gpgsign=false", "commit", "-m", "seed"]);
+        std::fs::write(repo.join("keep.txt"), "1\n2\nTWO-AND-A-HALF\n3\n4\n5\n6\n").unwrap();
+        std::fs::remove_file(repo.join("doomed.txt")).unwrap();
+        std::fs::write(repo.join("staged-new.txt"), "p\nq\n").unwrap();
+        git_in(&repo, &["add", "staged-new.txt"]);
+        std::fs::write(repo.join("untracked.txt"), "u1\nu2\nu3\n").unwrap();
+
+        // CLI baseline: tracked numstat (HEAD) + untracked line counts.
+        let out = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "diff", "--numstat", "--no-renames", "--no-color", "--no-ext-diff", "HEAD"])
+            .output()
+            .unwrap();
+        let (mut cli_add, mut cli_rem) = (0usize, 0usize);
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut p = line.split('\t');
+            if let (Some(a), Some(r)) = (p.next(), p.next()) {
+                cli_add += a.parse::<usize>().unwrap_or(0);
+                cli_rem += r.parse::<usize>().unwrap_or(0);
+            }
+        }
+        let untracked = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "ls-files", "--others", "--exclude-standard"])
+            .output()
+            .unwrap();
+        for f in String::from_utf8_lossy(&untracked.stdout).lines() {
+            cli_add += std::fs::read_to_string(repo.join(f)).unwrap().lines().count();
+        }
+
+        assert_eq!(get_diff_stats(&repo), Some((cli_add, cli_rem)));
+    }
+
+    #[test]
+    fn diff_stats_skips_binary_files() {
+        let (_tmp, repo) = init_temp_repo();
+        // A NUL byte marks the worktree blob binary — numstat reports `-`, so it
+        // contributes nothing to the +/- totals.
+        std::fs::write(repo.join("file.txt"), [0u8, 1, 2, 0, 5]).unwrap();
+        assert_eq!(get_diff_stats(&repo), Some((0, 0)));
     }
 }

@@ -350,43 +350,19 @@ pub fn invalidate_cache(path: &Path) {
 /// Get per-file diff summary for a repository.
 /// Returns a list of files with their add/remove counts.
 pub fn get_diff_file_summary(path: &Path) -> Vec<FileDiffSummary> {
-    use okena_core::process::{command, safe_output};
-
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return vec![],
-    };
-
     let mut summaries = Vec::new();
 
-    // Get tracked file changes with numstat.
-    // --no-renames: report renames as the new path directly (a delete of the
-    // old path + add of the new) instead of numstat's `old => new` /
-    // `{a => b}` arrow form, which would otherwise be stored verbatim as the
-    // file path. Keeps this consistent with get_diff_stats in repository.rs.
-    let output = safe_output(
-        command("git").args(["-C", path_str, "diff", "--numstat", "--no-renames", "--no-color", "--no-ext-diff", "HEAD"]),
-    )
-    .ok();
-
-    if let Some(output) = output
-        && output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() >= 3 {
-                    // Binary files show "-" instead of numbers
-                    let added = parts[0].parse::<usize>().unwrap_or(0);
-                    let removed = parts[1].parse::<usize>().unwrap_or(0);
-                    summaries.push(FileDiffSummary {
-                        path: parts[2].to_string(),
-                        added,
-                        removed,
-                        is_new: false,
-                    });
-                }
-            }
-        }
+    // Tracked changes vs HEAD via gix (no subprocess), the structured
+    // equivalent of `git diff --numstat --no-renames HEAD`. Best-effort: a
+    // transient walk failure yields no tracked entries rather than erroring.
+    for (file, added, removed) in repository::tracked_diff_counts(path).unwrap_or_default() {
+        summaries.push(FileDiffSummary {
+            path: file,
+            added,
+            removed,
+            is_new: false,
+        });
+    }
 
     // Get untracked files (best effort: silently skip on transient gix failure)
     for file in crate::gix_helpers::list_untracked_files(path).unwrap_or_default() {
@@ -410,6 +386,45 @@ pub fn get_diff_file_summary(path: &Path) -> Vec<FileDiffSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_file_summary_matches_git_cli() {
+        use crate::repository::test_support::{git_in, init_temp_repo};
+
+        let (_tmp, repo) = init_temp_repo();
+        // Modify a tracked file, delete one, stage a new one, leave one untracked.
+        std::fs::write(repo.join("file.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(repo.join("doomed.txt"), "x\ny\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["-c", "commit.gpgsign=false", "commit", "-m", "seed"]);
+        std::fs::write(repo.join("file.txt"), "a\nB\nc\nd\n").unwrap();
+        std::fs::remove_file(repo.join("doomed.txt")).unwrap();
+        std::fs::write(repo.join("staged.txt"), "p\nq\n").unwrap();
+        git_in(&repo, &["add", "staged.txt"]);
+        std::fs::write(repo.join("untracked.txt"), "u1\nu2\n").unwrap();
+
+        // CLI baseline keyed by path.
+        let mut want: std::collections::HashMap<String, (usize, usize, bool)> =
+            std::collections::HashMap::new();
+        let out = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "diff", "--numstat", "--no-renames", "--no-color", "--no-ext-diff", "HEAD"])
+            .output()
+            .unwrap();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() >= 3 {
+                want.insert(p[2].to_string(), (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0), false));
+            }
+        }
+        want.insert("untracked.txt".to_string(), (2, 0, true));
+
+        let got: std::collections::HashMap<String, (usize, usize, bool)> = get_diff_file_summary(&repo)
+            .into_iter()
+            .map(|s| (s.path, (s.added, s.removed, s.is_new)))
+            .collect();
+
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn ci_tooltip_all_passed() {
