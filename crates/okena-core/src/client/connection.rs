@@ -841,27 +841,34 @@ impl<H: ConnectionHandler> RemoteClient<H> {
                                                     handler_clone.remove_terminal(&prefixed);
                                                 }
 
-                                                // Subscribe to new terminals
-                                                if !diff.added_terminals.is_empty() {
-                                                    let _ = ws_tx_clone.try_send(
+                                                // Subscribe to new terminals. Use a blocking
+                                                // send (not try_send): dropping this on a full
+                                                // channel would leave the new terminals silently
+                                                // never streaming output.
+                                                if !diff.added_terminals.is_empty()
+                                                    && let Err(e) = ws_tx_clone.send(
                                                         WsClientMessage::Subscribe {
                                                             terminal_ids: diff
                                                                 .added_terminals
                                                                 .clone(),
                                                         },
-                                                    );
-                                                }
+                                                    ).await {
+                                                        log::warn!("failed to send Subscribe for {} terminals: {}", diff.added_terminals.len(), e);
+                                                    }
 
-                                                // Unsubscribe from removed terminals
-                                                if !diff.removed_terminals.is_empty() {
-                                                    let _ = ws_tx_clone.try_send(
+                                                // Unsubscribe from removed terminals. Likewise
+                                                // blocking — a dropped Unsubscribe leaks a stream
+                                                // for an already-gone terminal.
+                                                if !diff.removed_terminals.is_empty()
+                                                    && let Err(e) = ws_tx_clone.send(
                                                         WsClientMessage::Unsubscribe {
                                                             terminal_ids: diff
                                                                 .removed_terminals
                                                                 .clone(),
                                                         },
-                                                    );
-                                                }
+                                                    ).await {
+                                                        log::warn!("failed to send Unsubscribe for {} terminals: {}", diff.removed_terminals.len(), e);
+                                                    }
 
                                                 cached_state = new_state.clone();
 
