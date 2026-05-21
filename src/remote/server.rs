@@ -84,15 +84,17 @@ impl RemoteServer {
                 next_connection_id,
             );
 
-            axum::serve(
+            let serve_result = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown_signal(shutdown_rx_clone))
-            .await
-            .ok();
+            .await;
 
-            log::info!("Remote control server shut down");
+            match serve_result {
+                Ok(()) => log::info!("Remote control server shut down"),
+                Err(e) => log::error!("Remote control server exited with error: {e}"),
+            }
         });
 
         Ok(Self {

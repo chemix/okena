@@ -75,16 +75,14 @@ pub fn safe_output_with_timeout(
 /// Open a URL in the default browser and reap the opener process.
 pub fn open_url(url: &str) {
     #[cfg(target_os = "linux")]
-    {
-        let _ = spawn_and_reap(command("xdg-open").arg(url));
-    }
+    let result = spawn_and_reap(command("xdg-open").arg(url));
     #[cfg(target_os = "macos")]
-    {
-        let _ = spawn_and_reap(command("open").arg(url));
-    }
+    let result = spawn_and_reap(command("open").arg(url));
     #[cfg(windows)]
-    {
-        let _ = spawn_and_reap(command("cmd").args(["/C", "start", "", url]));
+    let result = spawn_and_reap(command("cmd").args(["/C", "start", "", url]));
+
+    if let Err(e) = result {
+        log::warn!("failed to open URL {url:?}: {e}");
     }
 }
 
