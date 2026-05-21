@@ -7,7 +7,7 @@
 //! pure tree algorithms (navigation, mutation, normalization, structure
 //! merging) — no GPUI, no workspace state, no hook execution.
 
-use okena_terminal::shell_config::ShellType;
+use okena_core::shell::ShellType;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -762,7 +762,7 @@ impl LayoutNode {
 #[cfg(test)]
 mod tests {
     use super::{LayoutNode, SplitDirection};
-    use okena_terminal::shell_config::ShellType;
+    use okena_core::shell::ShellType;
     use std::collections::HashSet;
 
     fn terminal(id: &str) -> LayoutNode {

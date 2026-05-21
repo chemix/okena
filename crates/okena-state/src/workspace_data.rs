@@ -4,7 +4,7 @@ use crate::hooks_config::HooksConfig;
 use crate::window_state::WindowState;
 use okena_core::theme::FolderColor;
 use okena_layout::LayoutNode;
-use okena_terminal::shell_config::ShellType;
+use okena_core::shell::ShellType;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 

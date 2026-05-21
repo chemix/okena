@@ -1,7 +1,7 @@
 use crate::session_backend::{ResolvedBackend, SessionBackend};
 #[cfg(not(windows))]
 use crate::session_backend::get_extended_path;
-use crate::shell_config::ShellType;
+use crate::shell_config::{ShellCommandExt, ShellType};
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;

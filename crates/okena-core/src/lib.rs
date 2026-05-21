@@ -10,6 +10,7 @@ pub mod process;
 pub mod profiles;
 pub mod selection;
 pub mod send_payload;
+pub mod shell;
 pub mod theme;
 pub mod timing;
 pub mod types;
