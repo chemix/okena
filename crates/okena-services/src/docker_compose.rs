@@ -10,26 +10,41 @@ use std::time::{Duration, Instant, SystemTime};
 /// from blocking background executor threads and starving the UI.
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a *successful* `docker compose version` check stays cached.
-const AVAILABLE_TTL: Duration = Duration::from_secs(60);
+/// How long a *successful* `docker compose version` check stays cached. Once
+/// Docker is up it stays up for the session.
+const AVAILABLE_TTL_OK: Duration = Duration::from_secs(60);
+/// How long a *failed* check stays cached — short, so Docker Desktop starting
+/// later is picked up quickly and a `false` never becomes sticky.
+const AVAILABLE_TTL_FAIL: Duration = Duration::from_secs(5);
 
-/// Last time `docker compose version` was confirmed available. Only successes
-/// are cached (see [`is_docker_compose_available`]).
-static AVAILABLE_OK_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// Cached `docker compose version` result with the time it was taken.
+static AVAILABLE_CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+/// Single-flight gate so the per-project pollers waking together at startup
+/// don't all spawn `docker compose version` at once.
+static AVAILABLE_REFRESH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Check if `docker compose` CLI is available.
 ///
-/// Caches **only success** for [`AVAILABLE_TTL`]: once Docker is up it stays up
-/// for the session, so re-spawning `docker compose version` on every service
-/// poll (per project) is pure waste. A *failure* is deliberately never cached —
-/// Docker Desktop may not have started yet, and a sticky `false` would
-/// permanently disable the integration; so we keep re-checking until it works.
+/// Cached with an asymmetric TTL — 60s for success, 5s for failure — so the
+/// check isn't re-spawned on every service poll, yet a not-yet-running Docker
+/// is re-probed every few seconds rather than disabled for the session.
+/// Refreshes are single-flighted to avoid a startup thundering herd.
 pub fn is_docker_compose_available() -> bool {
-    if let Ok(guard) = AVAILABLE_OK_AT.lock()
-        && let Some(ts) = *guard
-        && ts.elapsed() < AVAILABLE_TTL
-    {
-        return true;
+    let cached = || {
+        AVAILABLE_CACHE.lock().ok().and_then(|g| {
+            g.and_then(|(ts, ok)| {
+                let ttl = if ok { AVAILABLE_TTL_OK } else { AVAILABLE_TTL_FAIL };
+                (ts.elapsed() < ttl).then_some(ok)
+            })
+        })
+    };
+
+    if let Some(ok) = cached() {
+        return ok;
+    }
+    let _flight = AVAILABLE_REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ok) = cached() {
+        return ok;
     }
 
     let mut cmd = process::command("docker");
@@ -38,8 +53,8 @@ pub fn is_docker_compose_available() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    if ok && let Ok(mut guard) = AVAILABLE_OK_AT.lock() {
-        *guard = Some(Instant::now());
+    if let Ok(mut guard) = AVAILABLE_CACHE.lock() {
+        *guard = Some((Instant::now(), ok));
     }
     ok
 }
