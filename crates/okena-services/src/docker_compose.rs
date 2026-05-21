@@ -210,6 +210,11 @@ const PS_SNAPSHOT_TTL: Duration = Duration::from_secs(4);
 /// regardless of how many projects are polling.
 static PS_SNAPSHOT: Mutex<Option<(Instant, Vec<ContainerSnapshot>)>> = Mutex::new(None);
 
+/// Single-flight gate for refreshing [`PS_SNAPSHOT`]. Without it, all per-project
+/// pollers waking on the same ~5s tick find the cache stale at once and each
+/// spawn their own `docker ps` before any stores a result (thundering herd).
+static PS_REFRESH_LOCK: Mutex<()> = Mutex::new(());
+
 /// One compose container distilled from `docker ps -a --format json`.
 #[derive(Clone)]
 struct ContainerSnapshot {
@@ -313,13 +318,29 @@ fn refresh_ps_snapshot() -> crate::ServiceResult<Vec<ContainerSnapshot>> {
 }
 
 /// Get the shared container snapshot, refreshing it if older than the TTL.
+/// Refreshes are single-flighted: concurrent callers that find the cache stale
+/// block on `PS_REFRESH_LOCK`, then re-check and reuse the snapshot the winner
+/// just stored, so only one `docker ps` runs per refresh window.
 fn ps_snapshot() -> crate::ServiceResult<Vec<ContainerSnapshot>> {
-    if let Ok(guard) = PS_SNAPSHOT.lock()
-        && let Some((ts, snap)) = guard.as_ref()
-        && ts.elapsed() < PS_SNAPSHOT_TTL
-    {
-        return Ok(snap.clone());
+    let fresh_cached = || {
+        PS_SNAPSHOT.lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|(ts, _)| ts.elapsed() < PS_SNAPSHOT_TTL)
+                .map(|(_, snap)| snap.clone())
+        })
+    };
+
+    if let Some(snap) = fresh_cached() {
+        return Ok(snap);
     }
+
+    // Stale: serialize refreshes. Whoever gets the lock first refreshes; the
+    // rest re-check below and reuse the freshly stored snapshot.
+    let _flight = PS_REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(snap) = fresh_cached() {
+        return Ok(snap);
+    }
+
     let fresh = refresh_ps_snapshot()?;
     if let Ok(mut guard) = PS_SNAPSHOT.lock() {
         *guard = Some((Instant::now(), fresh.clone()));
@@ -540,6 +561,7 @@ mod tests {
         assert_eq!(result, vec!["db", "redis", "web"]);
     }
 }
+
 
 
 
