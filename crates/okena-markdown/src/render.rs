@@ -11,31 +11,36 @@ use super::types::{char_len, slice_by_chars, Inline, Node};
 use super::{MarkdownDocument, RenderedNode};
 
 impl MarkdownDocument {
-    /// Render the document as a list of RenderedNode items.
-    /// This allows the caller to wrap each node/line with mouse handlers.
-    /// Code blocks are returned with individual lines for per-line selection.
-    pub fn render_nodes_with_offsets(
+    /// Number of top-level blocks in the document. Each maps to one list item.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Render a single top-level node by index, ready for the caller to wrap
+    /// with mouse handlers. Code blocks/tables are returned with their
+    /// individual selectable lines/rows. Returns None if `idx` is out of range.
+    pub fn render_node(
         &self,
+        idx: usize,
         t: &ThemeColors,
         cx: &App,
         selection: Option<(usize, usize)>,
-    ) -> Vec<RenderedNode> {
-        let mut result = Vec::new();
+    ) -> Option<RenderedNode> {
+        let node = self.nodes.get(idx)?;
+        let offset = self.node_offsets.get(idx).copied().unwrap_or(0);
+        let node_len = Self::node_text_length(node);
+        let node_selection = selection.and_then(|(start, end)| {
+            if end <= offset || start >= offset + node_len {
+                None
+            } else {
+                Some((
+                    start.saturating_sub(offset),
+                    (end - offset).min(node_len),
+                ))
+            }
+        });
 
-        for (node, &offset) in self.nodes.iter().zip(self.node_offsets.iter()) {
-            let node_len = Self::node_text_length(node);
-            let node_selection = selection.and_then(|(start, end)| {
-                if end <= offset || start >= offset + node_len {
-                    None
-                } else {
-                    Some((
-                        start.saturating_sub(offset),
-                        (end - offset).min(node_len),
-                    ))
-                }
-            });
-
-            match node {
+        let rendered = match node {
                 Node::CodeBlock { language, code } => {
                     // Return code blocks with individual lines for per-line selection
                     let selection_bg = rgba(0x3390ff40);
@@ -77,28 +82,14 @@ impl MarkdownDocument {
                         line_offset = line_end;
                     }
 
-                    result.push(RenderedNode::CodeBlock {
+                    RenderedNode::CodeBlock {
                         language: language.clone(),
                         lines,
-                    });
-                }
-                Node::Table { headers, rows } => {
-                    // Return tables with individual rows for per-row selection
-
-                    // Calculate column widths
-                    let mut col_widths: Vec<usize> = headers
-                        .iter()
-                        .map(|h| char_len(&Self::render_inlines_as_text(h)))
-                        .collect();
-                    for row in rows {
-                        for (i, cell) in row.iter().enumerate() {
-                            let len = char_len(&Self::render_inlines_as_text(cell));
-                            if i < col_widths.len() {
-                                col_widths[i] = col_widths[i].max(len);
-                            }
-                        }
                     }
-
+                }
+                Node::Table { headers, rows, col_widths } => {
+                    // Return tables with individual rows for per-row selection.
+                    // Column widths are precomputed at parse time.
                     let mut row_offset = offset;
                     let mut rendered_rows = Vec::new();
                     let mut rendered_header = None;
@@ -212,24 +203,23 @@ impl MarkdownDocument {
                         row_offset = row_end;
                     }
 
-                    result.push(RenderedNode::Table {
+                    RenderedNode::Table {
                         header: rendered_header,
                         rows: rendered_rows,
-                    });
+                    }
                 }
                 _ => {
                     // Other nodes are simple blocks
                     let node_div = Self::render_node_with_selection(node, t, cx, node_selection);
-                    result.push(RenderedNode::Simple {
+                    RenderedNode::Simple {
                         div: node_div,
                         start_offset: offset,
                         end_offset: offset + node_len,
-                    });
+                    }
                 }
-            }
-        }
+            };
 
-        result
+        Some(rendered)
     }
 
 
@@ -248,7 +238,7 @@ impl MarkdownDocument {
             Node::List { items, .. } => {
                 items.iter().map(|item| Self::inlines_text_length(item) + 1).sum()
             }
-            Node::Table { headers, rows } => {
+            Node::Table { headers, rows, .. } => {
                 let header_len: usize = headers.iter().map(|h| Self::inlines_text_length(h)).sum::<usize>()
                     + headers.len().saturating_sub(1) // tabs
                     + 1; // newline
@@ -409,8 +399,8 @@ impl MarkdownDocument {
                 }
                 list
             }
-            Node::Table { headers, rows } => {
-                Self::render_table_with_selection(headers, rows, t, cx, selection)
+            Node::Table { headers, rows, col_widths } => {
+                Self::render_table_with_selection(headers, rows, col_widths, t, cx, selection)
             }
             Node::Blockquote { children } => {
                 div()
@@ -590,25 +580,12 @@ impl MarkdownDocument {
     fn render_table_with_selection(
         headers: &[Vec<Inline>],
         rows: &[Vec<Vec<Inline>>],
+        col_widths: &[usize],
         t: &ThemeColors,
         cx: &App,
         selection: Option<(usize, usize)>,
     ) -> Div {
-        // Calculate column widths based on content (using character count)
-        let mut col_widths: Vec<usize> = headers
-            .iter()
-            .map(|h| char_len(&Self::render_inlines_as_text(h)))
-            .collect();
-
-        for row in rows {
-            for (i, cell) in row.iter().enumerate() {
-                let len = char_len(&Self::render_inlines_as_text(cell));
-                if i < col_widths.len() {
-                    col_widths[i] = col_widths[i].max(len);
-                }
-            }
-        }
-
+        // Column widths are precomputed at parse time.
         let mut table = v_flex()
             .rounded(px(4.0))
             .border_1()

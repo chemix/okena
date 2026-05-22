@@ -7,7 +7,13 @@ pub(crate) enum Node {
     Paragraph { children: Vec<Inline> },
     CodeBlock { language: Option<String>, code: String },
     List { ordered: bool, items: Vec<Vec<Inline>> },
-    Table { headers: Vec<Vec<Inline>>, rows: Vec<Vec<Vec<Inline>>> },
+    Table {
+        headers: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+        /// Per-column display width (in characters), precomputed at parse time so
+        /// rendering does not re-measure every cell on every frame.
+        col_widths: Vec<usize>,
+    },
     Blockquote { children: Vec<Inline> },
     HorizontalRule,
 }

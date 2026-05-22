@@ -133,10 +133,10 @@ impl MarkdownDocument {
                     table_rows.clear();
                 }
                 Event::End(TagEnd::Table) => {
-                    nodes.push(Node::Table {
-                        headers: std::mem::take(&mut table_headers),
-                        rows: std::mem::take(&mut table_rows),
-                    });
+                    let headers = std::mem::take(&mut table_headers);
+                    let rows = std::mem::take(&mut table_rows);
+                    let col_widths = Self::table_col_widths(&headers, &rows);
+                    nodes.push(Node::Table { headers, rows, col_widths });
                     in_table = false;
                 }
                 Event::Start(Tag::TableHead) => {
@@ -279,7 +279,7 @@ impl MarkdownDocument {
                     text.push('\n');
                 }
             }
-            Node::Table { headers, rows } => {
+            Node::Table { headers, rows, .. } => {
                 for (i, header) in headers.iter().enumerate() {
                     if i > 0 { text.push('\t'); }
                     Self::inlines_to_flat_text(header, text);
@@ -297,6 +297,25 @@ impl MarkdownDocument {
                 text.push('\n');
             }
         }
+    }
+
+    /// Compute per-column display widths (in characters) for a table: the max
+    /// content length across the header and every row cell in that column.
+    pub(crate) fn table_col_widths(
+        headers: &[Vec<Inline>],
+        rows: &[Vec<Vec<Inline>>],
+    ) -> Vec<usize> {
+        let mut col_widths: Vec<usize> =
+            headers.iter().map(|h| Self::inlines_text_length(h)).collect();
+        for row in rows {
+            for (i, cell) in row.iter().enumerate() {
+                let len = Self::inlines_text_length(cell);
+                if i < col_widths.len() {
+                    col_widths[i] = col_widths[i].max(len);
+                }
+            }
+        }
+        col_widths
     }
 
     /// Convert inline elements to flat text.
