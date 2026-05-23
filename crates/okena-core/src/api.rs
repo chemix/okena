@@ -26,11 +26,145 @@ pub struct StateResponse {
     pub folders: Vec<ApiFolder>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// PR state from GitHub
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+    Draft,
+}
+
+impl PrState {
+    /// Display label for this PR state
+    pub fn label(&self) -> &'static str {
+        match self {
+            PrState::Open => "Open",
+            PrState::Draft => "Draft",
+            PrState::Merged => "Merged",
+            PrState::Closed => "Closed",
+        }
+    }
+}
+
+/// Overall CI check rollup status
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CiStatus {
+    Success,
+    Failure,
+    Pending,
+}
+
+impl CiStatus {
+    pub fn icon(&self) -> &'static str {
+        match self {
+            CiStatus::Success => "icons/check.svg",
+            CiStatus::Failure => "icons/close.svg",
+            CiStatus::Pending => "icons/refresh.svg",
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self, CiStatus::Pending)
+    }
+}
+
+/// A single CI check / status entry as returned by `gh pr checks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiCheck {
+    /// Display name (e.g. "Lint", "Test (ubuntu-latest)").
+    pub name: String,
+    /// Workflow name (e.g. "CI", "Vercel"). `None` for non-Actions checks
+    /// where `gh` doesn't expose a workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// Bucket-derived overall status (pass/fail/pending). Skipped checks
+    /// are represented by `Pending` and `is_skipped`.
+    pub status: CiStatus,
+    /// True for checks whose bucket is `"skipping"` — rendered with a
+    /// distinct icon and not counted toward pass/fail in the summary.
+    #[serde(default)]
+    pub is_skipped: bool,
+    /// Direct link to the run/check on GitHub (or provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Human-readable description, when `gh` provides one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Elapsed time in milliseconds. `0` when unknown / still running.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+impl CiCheck {
+    /// Format `elapsed_ms` as compact "Xs" or "XmYs" (or "—" when 0).
+    pub fn elapsed_label(&self) -> String {
+        if self.elapsed_ms == 0 {
+            return "\u{2014}".to_string();
+        }
+        let secs = self.elapsed_ms / 1000;
+        if secs < 60 {
+            format!("{}s", secs)
+        } else {
+            format!("{}m{}s", secs / 60, secs % 60)
+        }
+    }
+}
+
+/// Summary of CI check results
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiCheckSummary {
+    pub status: CiStatus,
+    pub passed: usize,
+    pub failed: usize,
+    pub pending: usize,
+    pub total: usize,
+    /// Per-check details; empty when `gh pr checks` didn't return rich
+    /// info (e.g. on older `gh` versions).
+    #[serde(default)]
+    pub checks: Vec<CiCheck>,
+}
+
+impl CiCheckSummary {
+    pub fn tooltip_text(&self) -> String {
+        match self.status {
+            CiStatus::Success => format!("{}/{} checks passed", self.passed, self.total),
+            CiStatus::Failure => format!("{} failed, {} passed of {} checks", self.failed, self.passed, self.total),
+            CiStatus::Pending => format!("{} pending, {} passed of {} checks", self.pending, self.passed, self.total),
+        }
+    }
+}
+
+/// Pull request info
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrInfo {
+    pub url: String,
+    pub state: PrState,
+    pub number: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ApiGitStatus {
     pub branch: Option<String>,
     pub lines_added: usize,
     pub lines_removed: usize,
+    /// Pull request info for the current branch (if any). Populated on the
+    /// host from `gh` and forwarded to remote clients so the status pill shows
+    /// the PR badge over a connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_info: Option<PrInfo>,
+    /// CI / pipeline status for the current branch's HEAD commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_checks: Option<CiCheckSummary>,
+    /// Commits the local branch is ahead of its upstream (`None` if no upstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ahead: Option<usize>,
+    /// Commits the local branch is behind its upstream (`None` if no upstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<usize>,
+    /// Commits not yet pushed to `origin/<branch>` (`None` if never pushed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpushed: Option<usize>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -513,6 +647,59 @@ mod tests {
         assert_eq!(parsed.project_order.len(), 0);
         assert_eq!(parsed.folders.len(), 0);
         assert!(matches!(parsed.projects[0].folder_color, FolderColor::Default));
+    }
+
+    #[test]
+    fn api_git_status_round_trips_pr_and_ci() {
+        let status = ApiGitStatus {
+            branch: Some("feature/x".into()),
+            lines_added: 12,
+            lines_removed: 4,
+            pr_info: Some(PrInfo {
+                url: "https://github.com/o/r/pull/7".into(),
+                state: PrState::Open,
+                number: 7,
+            }),
+            ci_checks: Some(CiCheckSummary {
+                status: CiStatus::Failure,
+                passed: 2,
+                failed: 1,
+                pending: 0,
+                total: 3,
+                checks: vec![CiCheck {
+                    name: "Lint".into(),
+                    workflow: Some("CI".into()),
+                    status: CiStatus::Failure,
+                    is_skipped: false,
+                    link: Some("https://github.com/o/r/runs/1".into()),
+                    description: None,
+                    elapsed_ms: 65_000,
+                }],
+            }),
+            ahead: Some(3),
+            behind: Some(1),
+            unpushed: Some(2),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: ApiGitStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pr_info, status.pr_info);
+        assert_eq!(parsed.ci_checks, status.ci_checks);
+        assert_eq!(parsed.ahead, Some(3));
+        assert_eq!(parsed.behind, Some(1));
+        assert_eq!(parsed.unpushed, Some(2));
+        assert_eq!(parsed.ci_checks.as_ref().unwrap().checks[0].elapsed_label(), "1m5s");
+    }
+
+    #[test]
+    fn api_git_status_backward_compat_minimal() {
+        // An old host sends only branch + line counts; new optional fields
+        // must default to None rather than failing to parse.
+        let json = r#"{"branch":"main","lines_added":1,"lines_removed":0}"#;
+        let parsed: ApiGitStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.branch.as_deref(), Some("main"));
+        assert!(parsed.pr_info.is_none());
+        assert!(parsed.ci_checks.is_none());
+        assert!(parsed.ahead.is_none());
     }
 
     #[test]

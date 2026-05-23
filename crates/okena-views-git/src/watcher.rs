@@ -9,6 +9,22 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// Project the local `GitStatus` onto the slimmer wire type pushed to remote
+/// clients. Carries the GitHub PR/CI rollup and ahead/behind/unpushed counts
+/// so a remote workspace renders the same status pill as a local one.
+fn to_api(s: &GitStatus) -> ApiGitStatus {
+    ApiGitStatus {
+        branch: s.branch.clone(),
+        lines_added: s.lines_added,
+        lines_removed: s.lines_removed,
+        pr_info: s.pr_info.clone(),
+        ci_checks: s.ci_checks.clone(),
+        ahead: s.ahead,
+        behind: s.behind,
+        unpushed: s.unpushed,
+    }
+}
+
 /// How often to poll git status (seconds)
 const GIT_POLL_INTERVAL: u64 = 5;
 /// How many git poll cycles between PR URL checks (~60s)
@@ -110,18 +126,7 @@ impl GitStatusWatcher {
         let api_statuses: HashMap<String, ApiGitStatus> = self
             .statuses
             .iter()
-            .filter_map(|(id, status)| {
-                status.as_ref().map(|s| {
-                    (
-                        id.clone(),
-                        ApiGitStatus {
-                            branch: s.branch.clone(),
-                            lines_added: s.lines_added,
-                            lines_removed: s.lines_removed,
-                        },
-                    )
-                })
-            })
+            .filter_map(|(id, status)| status.as_ref().map(|s| (id.clone(), to_api(s))))
             .collect();
         self.remote_tx.send_modify(|current| {
             *current = api_statuses;
@@ -164,18 +169,7 @@ impl GitStatusWatcher {
                     let api_statuses: HashMap<String, ApiGitStatus> = this
                         .statuses
                         .iter()
-                        .filter_map(|(id, status)| {
-                            status.as_ref().map(|s| {
-                                (
-                                    id.clone(),
-                                    ApiGitStatus {
-                                        branch: s.branch.clone(),
-                                        lines_added: s.lines_added,
-                                        lines_removed: s.lines_removed,
-                                    },
-                                )
-                            })
-                        })
+                        .filter_map(|(id, status)| status.as_ref().map(|s| (id.clone(), to_api(s))))
                         .collect();
                     this.remote_tx.send_modify(|current| {
                         *current = api_statuses;

@@ -35,10 +35,44 @@ export interface ApiFolder {
   folder_color?: string;
 }
 
+export type PrState = "Open" | "Merged" | "Closed" | "Draft";
+
+export interface PrInfo {
+  url: string;
+  state: PrState;
+  number: number;
+}
+
+export type CiStatus = "Success" | "Failure" | "Pending";
+
+export interface CiCheck {
+  name: string;
+  workflow?: string;
+  status: CiStatus;
+  is_skipped?: boolean;
+  link?: string;
+  description?: string;
+  elapsed_ms?: number;
+}
+
+export interface CiCheckSummary {
+  status: CiStatus;
+  passed: number;
+  failed: number;
+  pending: number;
+  total: number;
+  checks?: CiCheck[];
+}
+
 export interface ApiGitStatus {
   branch: string | null;
   lines_added: number;
   lines_removed: number;
+  pr_info?: PrInfo | null;
+  ci_checks?: CiCheckSummary | null;
+  ahead?: number | null;
+  behind?: number | null;
+  unpushed?: number | null;
 }
 
 export type DiffMode = "working_tree" | "staged";

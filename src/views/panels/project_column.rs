@@ -405,11 +405,11 @@ impl ProjectColumn {
                         branch: g.branch.clone(),
                         lines_added: g.lines_added,
                         lines_removed: g.lines_removed,
-                        pr_info: None,
-                        ci_checks: None,
-                        ahead: None,
-                        behind: None,
-                        unpushed: None,
+                        pr_info: g.pr_info.clone(),
+                        ci_checks: g.ci_checks.clone(),
+                        ahead: g.ahead,
+                        behind: g.behind,
+                        unpushed: g.unpushed,
                     })
             });
 

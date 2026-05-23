@@ -171,6 +171,7 @@ mod tests {
                         branch: Some("main".into()),
                         lines_added: 10,
                         lines_removed: 3,
+                        ..Default::default()
                     },
                 )]
                 .into_iter()
