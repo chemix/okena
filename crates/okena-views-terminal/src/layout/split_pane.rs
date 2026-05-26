@@ -23,11 +23,16 @@ pub enum DragState {
         visible_sizes_sum: f32,
         action_dispatcher: Option<Box<dyn ActionDispatchClone>>,
     },
-    /// Resizing project columns
+    /// Resizing project columns (or rows, when `vertical`)
     ProjectColumn {
         divider_index: usize,
         project_ids: Vec<String>,
-        available_width: f32,
+        /// Available space along the resize axis (width for columns, height
+        /// for rows), minus divider thickness.
+        available_size: f32,
+        /// When true the projects are stacked as rows, so the drag tracks the
+        /// vertical axis instead of the horizontal one.
+        vertical: bool,
         initial_mouse_pos: Point<Pixels>,
         initial_widths: HashMap<String, f32>,
         min_col_width: f32,
@@ -149,9 +154,9 @@ pub fn compute_resize(
                 });
             }
         }
-        DragState::ProjectColumn { divider_index, project_ids, available_width, initial_mouse_pos, initial_widths, min_col_width } => {
-            let container_width = *available_width;
-            if container_width <= 0.0 {
+        DragState::ProjectColumn { divider_index, project_ids, available_size, vertical, initial_mouse_pos, initial_widths, min_col_width } => {
+            let container_size = *available_size;
+            if container_size <= 0.0 {
                 return;
             }
 
@@ -164,10 +169,14 @@ pub fn compute_resize(
             let left_initial = initial_widths.get(left_id).copied().unwrap_or(default_width);
             let right_initial = initial_widths.get(right_id).copied().unwrap_or(default_width);
 
-            let delta_px = f32::from(mouse_pos.x) - f32::from(initial_mouse_pos.x);
-            let delta_percent = delta_px / container_width * 100.0;
+            let delta_px = if *vertical {
+                f32::from(mouse_pos.y) - f32::from(initial_mouse_pos.y)
+            } else {
+                f32::from(mouse_pos.x) - f32::from(initial_mouse_pos.x)
+            };
+            let delta_percent = delta_px / container_size * 100.0;
 
-            let min_width = (*min_col_width / container_width * 100.0).max(5.0);
+            let min_width = (*min_col_width / container_size * 100.0).max(5.0);
 
             let left_new = (left_initial + delta_percent).max(min_width);
             let right_new = (right_initial - delta_percent).max(min_width);
@@ -262,13 +271,16 @@ pub fn render_project_divider(
     container_bounds: Rc<RefCell<Bounds<Pixels>>>,
     active_drag: &ActiveDrag,
     min_col_width: f32,
+    is_rows: bool,
     cx: &App,
 ) -> impl IntoElement {
     let t = theme(cx);
     let active_drag = active_drag.clone();
 
+    // A rows grid needs a horizontal divider (full width, drag along Y); a
+    // columns grid needs a vertical divider (full height, drag along X).
     ResizeHandle::new(
-        false,
+        is_rows,
         t.border,
         t.border_active,
         move |mouse_pos, cx| {
@@ -276,8 +288,12 @@ pub fn render_project_divider(
             let num_projects = project_ids.len();
             let num_dividers = num_projects.saturating_sub(1) as f32;
 
-            let viewport_width = f32::from(bounds.size.width);
-            let available_width = (viewport_width - num_dividers * 1.0).max(0.0);
+            let viewport_size = if is_rows {
+                f32::from(bounds.size.height)
+            } else {
+                f32::from(bounds.size.width)
+            };
+            let available_size = (viewport_size - num_dividers * 1.0).max(0.0);
 
             let ws = workspace.read(cx);
             let initial_widths: HashMap<String, f32> = project_ids.iter()
@@ -287,7 +303,8 @@ pub fn render_project_divider(
             *active_drag.borrow_mut() = Some(DragState::ProjectColumn {
                 divider_index,
                 project_ids: project_ids.clone(),
-                available_width,
+                available_size,
+                vertical: is_rows,
                 initial_mouse_pos: mouse_pos,
                 initial_widths,
                 min_col_width,

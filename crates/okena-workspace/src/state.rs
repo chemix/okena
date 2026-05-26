@@ -17,8 +17,8 @@ use std::collections::HashMap;
 pub use okena_layout::{LayoutNode, SplitDirection};
 pub use okena_state::{
     DropZone, FocusedTerminalState, FolderData, HookTerminalEntry, HookTerminalStatus,
-    PendingWorktreeClose, ProjectData, WindowBounds, WindowId, WindowState, WorkspaceData,
-    WorktreeMetadata,
+    PendingWorktreeClose, ProjectData, ProjectLayoutMode, WindowBounds, WindowId, WindowState,
+    WorkspaceData, WorktreeMetadata,
 };
 
 /// Global workspace wrapper for app-wide access (used by quit handler)
@@ -238,6 +238,25 @@ impl Workspace {
     ) {
         self.data.set_sidebar_open(window_id, open);
         self.notify_data(cx);
+    }
+
+    /// Read the project-grid orientation for the targeted window. Falls back
+    /// to the default (`Columns`) for an unknown window id.
+    pub fn project_layout_mode(&self, window_id: WindowId) -> ProjectLayoutMode {
+        self.data
+            .window(window_id)
+            .map(|w| w.project_layout)
+            .unwrap_or_default()
+    }
+
+    /// Flip the targeted window's project grid between columns and rows.
+    /// Percentages in `project_widths` are axis-agnostic, so relative sizing
+    /// is preserved across the flip. Persisted via `notify_data`.
+    pub fn toggle_project_layout_mode(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        if let Some(w) = self.data.window_mut(window_id) {
+            w.project_layout = w.project_layout.toggled();
+            self.notify_data(cx);
+        }
     }
 
     /// Spawn a fresh extra window onto `extra_windows` and return its id.
@@ -2133,6 +2152,36 @@ mod gpui_tests {
         workspace.read_with(cx, |ws: &Workspace, _cx| {
             assert_eq!(ws.data().main_window.project_widths.get("p1").copied(), Some(0.42));
             assert_eq!(ws.data_version(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn toggle_project_layout_mode_flips_and_persists(cx: &mut gpui::TestAppContext) {
+        // Per-window orientation defaults to Columns, flips to Rows on the
+        // first toggle and back on the second. Each flip bumps data_version
+        // so the auto-save observer persists the new orientation.
+        use crate::state::ProjectLayoutMode;
+        let data = make_workspace_data(vec![make_project("p1")], vec!["p1"]);
+        let workspace = cx.new(|_cx| Workspace::new(data));
+
+        workspace.read_with(cx, |ws: &Workspace, _cx| {
+            assert_eq!(ws.project_layout_mode(WindowId::Main), ProjectLayoutMode::Columns);
+        });
+
+        workspace.update(cx, |ws: &mut Workspace, cx| {
+            ws.toggle_project_layout_mode(WindowId::Main, cx);
+        });
+        workspace.read_with(cx, |ws: &Workspace, _cx| {
+            assert_eq!(ws.project_layout_mode(WindowId::Main), ProjectLayoutMode::Rows);
+            assert_eq!(ws.data_version(), 1);
+        });
+
+        workspace.update(cx, |ws: &mut Workspace, cx| {
+            ws.toggle_project_layout_mode(WindowId::Main, cx);
+        });
+        workspace.read_with(cx, |ws: &Workspace, _cx| {
+            assert_eq!(ws.project_layout_mode(WindowId::Main), ProjectLayoutMode::Columns);
+            assert_eq!(ws.data_version(), 2);
         });
     }
 

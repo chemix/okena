@@ -392,8 +392,12 @@ impl ProjectColumn {
         let effective_color = self.workspace.read(cx).effective_folder_color(project);
         let folder_color = t.get_folder_color(effective_color);
         let density = crate::settings::settings(cx).header_density;
+        // In the rows layout each project is short, so vertical space is
+        // precious: collapse the comfortable two-row header back to a single
+        // row (git info still shows, just inline) when the grid is stacked.
+        let is_rows = self.workspace.read(cx).project_layout_mode(self.window_id).is_rows();
         let is_comfortable =
-            density == crate::workspace::settings::HeaderDensity::Comfortable;
+            density == crate::workspace::settings::HeaderDensity::Comfortable && !is_rows;
 
         // Fetch git status once for both header badge and git status area
         let git_status = self.git_watcher.as_ref()

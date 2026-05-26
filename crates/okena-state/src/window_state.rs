@@ -9,6 +9,38 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+/// How project columns are arranged in a window's grid.
+///
+/// `Columns` (default) lays projects out side by side, each with a width;
+/// `Rows` stacks them vertically, each with a height. Stored per-window so
+/// each window can flip its own orientation independently. The persisted
+/// `project_widths` map holds axis-agnostic percentages, so it carries over
+/// unchanged when the orientation flips.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectLayoutMode {
+    /// Projects laid out side by side (horizontal, width-resized). Default.
+    #[default]
+    Columns,
+    /// Projects stacked vertically (height-resized).
+    Rows,
+}
+
+impl ProjectLayoutMode {
+    /// Return the opposite orientation.
+    pub fn toggled(self) -> Self {
+        match self {
+            ProjectLayoutMode::Columns => ProjectLayoutMode::Rows,
+            ProjectLayoutMode::Rows => ProjectLayoutMode::Columns,
+        }
+    }
+
+    /// True when projects are stacked vertically.
+    pub fn is_rows(self) -> bool {
+        matches!(self, ProjectLayoutMode::Rows)
+    }
+}
+
 /// Restore bounds for an OS window: origin + size in screen pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowBounds {
@@ -50,8 +82,15 @@ pub struct WindowState {
     #[serde(default)]
     pub folder_filter: Option<String>,
     /// Project column widths (percentages) scoped to this window.
+    ///
+    /// Axis-agnostic: in `ProjectLayoutMode::Columns` these are widths, in
+    /// `Rows` they are heights. The same percentage carries over when the
+    /// orientation flips, so a window's relative sizing survives a toggle.
     #[serde(default)]
     pub project_widths: HashMap<String, f32>,
+    /// Orientation of the project grid in this window (columns vs rows).
+    #[serde(default)]
+    pub project_layout: ProjectLayoutMode,
     /// Per-folder collapsed state in this window's sidebar.
     #[serde(default)]
     pub folder_collapsed: HashMap<String, bool>,
@@ -73,6 +112,7 @@ impl Default for WindowState {
             hidden_project_ids: HashSet::new(),
             folder_filter: None,
             project_widths: HashMap::new(),
+            project_layout: ProjectLayoutMode::default(),
             folder_collapsed: HashMap::new(),
             os_bounds: None,
             sidebar_open: None,
@@ -111,6 +151,7 @@ mod tests {
             hidden_project_ids: hidden,
             folder_filter: Some("folder-7".to_string()),
             project_widths: widths,
+            project_layout: ProjectLayoutMode::Rows,
             folder_collapsed: collapsed,
             os_bounds: Some(WindowBounds {
                 origin_x: 100.0,
@@ -128,6 +169,7 @@ mod tests {
         assert_eq!(reloaded.hidden_project_ids, original.hidden_project_ids);
         assert_eq!(reloaded.folder_filter, original.folder_filter);
         assert_eq!(reloaded.project_widths, original.project_widths);
+        assert_eq!(reloaded.project_layout, original.project_layout);
         assert_eq!(reloaded.folder_collapsed, original.folder_collapsed);
         assert_eq!(reloaded.os_bounds, original.os_bounds);
         assert_eq!(reloaded.sidebar_open, original.sidebar_open);
@@ -177,5 +219,6 @@ mod tests {
         assert!(s.folder_collapsed.is_empty());
         assert!(s.os_bounds.is_none());
         assert_eq!(s.sidebar_open, None);
+        assert_eq!(s.project_layout, ProjectLayoutMode::Columns);
     }
 }

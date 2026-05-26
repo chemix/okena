@@ -1,4 +1,4 @@
-use crate::keybindings::{ShowKeybindings, ShowSessionManager, ShowThemeSelector, ShowCommandPalette, ShowSettings, OpenSettingsFile, ShowFileSearch, ShowContentSearch, ShowProjectSwitcher, ShowDiffViewer, ShowHookLog, ShowLogConsole, NewProject, NewWindow, CloseWindow, ToggleSidebar, ToggleSidebarAutoHide, TogglePaneSwitcher, CreateWorktree, CheckForUpdates, InstallUpdate, FocusSidebar, FocusActiveProject, ShowPairingDialog, StartAllServices, StopAllServices, ClearFocus, EqualizeLayout, ShowBranchSwitcher, ShowProfileManager};
+use crate::keybindings::{ShowKeybindings, ShowSessionManager, ShowThemeSelector, ShowCommandPalette, ShowSettings, OpenSettingsFile, ShowFileSearch, ShowContentSearch, ShowProjectSwitcher, ShowDiffViewer, ShowHookLog, ShowLogConsole, NewProject, NewWindow, CloseWindow, ToggleSidebar, ToggleSidebarAutoHide, TogglePaneSwitcher, CreateWorktree, CheckForUpdates, InstallUpdate, FocusSidebar, FocusActiveProject, ShowPairingDialog, StartAllServices, StopAllServices, ClearFocus, EqualizeLayout, ToggleProjectLayout, ShowBranchSwitcher, ShowProfileManager};
 use crate::settings::{open_settings_file, settings_entity};
 use crate::theme::theme;
 use crate::views::layout::navigation::{get_pane_map, prune_pane_map};
@@ -59,43 +59,56 @@ impl WindowView {
             None => return,
         };
 
+        let is_rows = workspace.project_layout_mode(self.window_id).is_rows();
         let settings = settings_entity(cx).read(cx).settings.clone();
-        let container_width = f32::from(self.projects_grid_bounds.borrow().size.width);
+        let container_size = {
+            let b = self.projects_grid_bounds.borrow();
+            f32::from(if is_rows { b.size.height } else { b.size.width })
+        };
 
         let raw_widths: Vec<f32> = visible_projects.iter()
             .map(|id| workspace.get_project_width(self.window_id, id, num_projects))
             .collect();
         let widths = Self::normalize_widths(&raw_widths);
-        let pixel_widths = Self::to_pixel_widths(&widths, container_width, settings.min_column_width);
+        let pixel_widths = Self::to_pixel_widths(&widths, container_size, settings.min_column_width);
 
-        // Compute the left edge (x offset) of the focused column
-        let mut col_left: f32 = 0.0;
+        // Compute the leading edge (along the grid axis) of the focused project
+        let mut col_lead: f32 = 0.0;
         for width in &pixel_widths[..focused_idx] {
-            col_left += width + 1.0; // +1 for divider
+            col_lead += width + 1.0; // +1 for divider
         }
 
-        let new_offset = if center {
-            // Center the focused column in the viewport
-            let col_center = col_left + pixel_widths[focused_idx] / 2.0;
-            -(col_center - container_width / 2.0)
-        } else {
-            let col_right = col_left + pixel_widths[focused_idx];
-            let current_offset = f32::from(self.projects_scroll_handle.offset().x);
-            let viewport_left = -current_offset;
-            let viewport_right = viewport_left + container_width;
+        let current_offset_axis = {
+            let o = self.projects_scroll_handle.offset();
+            f32::from(if is_rows { o.y } else { o.x })
+        };
 
-            if col_left < viewport_left {
-                -col_left
-            } else if col_right > viewport_right {
-                -(col_right - container_width)
+        let new_offset = if center {
+            // Center the focused project in the viewport
+            let col_center = col_lead + pixel_widths[focused_idx] / 2.0;
+            -(col_center - container_size / 2.0)
+        } else {
+            let col_trail = col_lead + pixel_widths[focused_idx];
+            let viewport_lead = -current_offset_axis;
+            let viewport_trail = viewport_lead + container_size;
+
+            if col_lead < viewport_lead {
+                -col_lead
+            } else if col_trail > viewport_trail {
+                -(col_trail - container_size)
             } else {
                 return; // already visible
             }
         };
 
         let max_offset = self.projects_scroll_handle.max_offset();
-        let clamped = new_offset.clamp(-f32::from(max_offset.x), 0.0);
-        self.projects_scroll_handle.set_offset(point(px(clamped), px(0.0)));
+        if is_rows {
+            let clamped = new_offset.clamp(-f32::from(max_offset.y), 0.0);
+            self.projects_scroll_handle.set_offset(point(px(0.0), px(clamped)));
+        } else {
+            let clamped = new_offset.clamp(-f32::from(max_offset.x), 0.0);
+            self.projects_scroll_handle.set_offset(point(px(clamped), px(0.0)));
+        }
     }
 
     pub(super) fn render_projects_grid(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -108,9 +121,12 @@ impl WindowView {
             let num_visible = workspace.visible_projects(self.window_id, fm.focused_project_id(), fm.is_focus_individual()).len();
             let is_zoomed = fm.focused_project_id().is_some();
 
+            let is_rows = workspace.project_layout_mode(self.window_id).is_rows();
+            let max_offset = self.projects_scroll_handle.max_offset();
+            let axis_overflow = if is_rows { max_offset.y } else { max_offset.x };
             if is_zoomed || num_visible <= 1 {
                 // Still zoomed or only one project — no centering needed
-            } else if self.projects_scroll_handle.max_offset().x > px(0.0) {
+            } else if axis_overflow > px(0.0) {
                 self.scroll_to_focused_project(Some(&project_id), true, cx);
             } else {
                 // Layout hasn't updated yet — re-queue for next frame
@@ -215,6 +231,9 @@ impl WindowView {
         // Get widths for each project
         let settings = settings_entity(cx).read(cx).settings.clone();
 
+        // Per-window orientation: columns (side by side) vs rows (stacked).
+        let is_rows = self.workspace.read(cx).project_layout_mode(self.window_id).is_rows();
+
         let widths: Vec<f32> = if num_projects <= 1 {
             vec![100.0; num_projects]
         } else {
@@ -228,21 +247,26 @@ impl WindowView {
         // Persistent bounds reference for resize calculation (survives across renders)
         let container_bounds = self.projects_grid_bounds.clone();
 
-        // Compute pixel widths from percentages, accounting for divider widths
-        let container_width = f32::from(container_bounds.borrow().size.width);
-        let pixel_widths = Self::to_pixel_widths(&widths, container_width, settings.min_column_width);
+        // Compute pixel sizes from percentages, accounting for divider thickness.
+        // The relevant axis is width for columns, height for rows.
+        let container_size = {
+            let b = container_bounds.borrow();
+            f32::from(if is_rows { b.size.height } else { b.size.width })
+        };
+        let pixel_widths = Self::to_pixel_widths(&widths, container_size, settings.min_column_width);
 
         // Build interleaved columns and dividers
         let mut elements: Vec<AnyElement> = Vec::new();
 
         for (i, project_id) in visible_projects.iter().enumerate() {
-            let pixel_width = pixel_widths.get(i).copied().unwrap_or(200.0);
+            let pixel_size = pixel_widths.get(i).copied().unwrap_or(200.0);
 
             if let Some(col) = self.project_columns.get(project_id).cloned() {
                 let col_element = div()
-                    .w(px(pixel_width))
+                    // Fixed size along the grid axis, stretch on the cross axis.
+                    .when(is_rows, |d| d.h(px(pixel_size)).w_full())
+                    .when(!is_rows, |d| d.w(px(pixel_size)).h_full())
                     .flex_shrink_0()
-                    .h_full()
                     .child(AnyView::from(col).cached(
                         StyleRefinement::default().size_full()
                     ))
@@ -250,7 +274,7 @@ impl WindowView {
 
                 elements.push(col_element);
 
-                // Add divider after each column except the last
+                // Add divider after each project except the last
                 if i < num_projects - 1 {
                     let min_col_width = settings_entity(cx).read(cx).settings.min_column_width;
                     let divider = render_project_divider(
@@ -261,6 +285,7 @@ impl WindowView {
                         container_bounds.clone(),
                         &self.active_drag,
                         min_col_width,
+                        is_rows,
                         cx,
                     );
                     elements.push(divider.into_any_element());
@@ -279,27 +304,39 @@ impl WindowView {
             .flex_1()
             .h_full()
             .min_w_0()
-            .overflow_x_hidden()
+            .min_h_0()
+            // Clip overflow along the grid axis; the scrollbar drives it.
+            .when(is_rows, |d| d.overflow_y_hidden())
+            .when(!is_rows, |d| d.overflow_x_hidden())
             .relative()
-            // Horizontal scrolling of project columns: shift+scroll or native touchpad horizontal scroll
+            // Scroll the project grid along its axis. Columns scroll
+            // horizontally (shift+wheel or native horizontal wheel); rows
+            // scroll vertically with the natural wheel.
             .on_scroll_wheel(cx.listener(move |_this, event: &ScrollWheelEvent, _window, cx| {
                 let delta = event.delta.pixel_delta(px(17.0));
-                let scroll_amount = if event.modifiers.shift {
-                    // Shift+scroll: use horizontal delta if present, otherwise convert vertical
-                    if !delta.x.is_zero() { delta.x } else { delta.y }
-                } else if !delta.x.is_zero() {
-                    // Native touchpad horizontal scroll
-                    delta.x
-                } else {
-                    return;
-                };
                 let max_offset = scroll_handle_for_wheel.max_offset();
-                if max_offset.x <= px(2.0) {
-                    return;
-                }
                 let current = scroll_handle_for_wheel.offset();
-                let new_x = (current.x + scroll_amount).clamp(-max_offset.x, px(0.0));
-                scroll_handle_for_wheel.set_offset(point(new_x, current.y));
+                if is_rows {
+                    let amount = if !delta.y.is_zero() { delta.y } else { delta.x };
+                    if amount.is_zero() || max_offset.y <= px(2.0) {
+                        return;
+                    }
+                    let new_y = (current.y + amount).clamp(-max_offset.y, px(0.0));
+                    scroll_handle_for_wheel.set_offset(point(current.x, new_y));
+                } else {
+                    let amount = if event.modifiers.shift {
+                        if !delta.x.is_zero() { delta.x } else { delta.y }
+                    } else if !delta.x.is_zero() {
+                        delta.x
+                    } else {
+                        return;
+                    };
+                    if max_offset.x <= px(2.0) {
+                        return;
+                    }
+                    let new_x = (current.x + amount).clamp(-max_offset.x, px(0.0));
+                    scroll_handle_for_wheel.set_offset(point(new_x, current.y));
+                }
                 cx.notify();
             }))
             .child(
@@ -307,7 +344,8 @@ impl WindowView {
                     .id("projects-grid")
                     .size_full()
                     .flex()
-                    .overflow_x_hidden()
+                    .when(is_rows, |d| d.flex_col().overflow_y_hidden())
+                    .when(!is_rows, |d| d.overflow_x_hidden())
                     .track_scroll(&self.projects_scroll_handle)
                     // Canvas to capture container bounds (updates persistent bounds for next render)
                     .child(canvas(
@@ -322,50 +360,60 @@ impl WindowView {
                     // Mouse handlers are on root div - no need to duplicate here
                     .children(elements)
             )
-            // Horizontal scrollbar overlay (absolute positioned at bottom)
+            // Scrollbar overlay: along the bottom for columns, along the right
+            // edge for rows. Drag state (`hscroll_*`) is axis-agnostic since
+            // only one orientation is active at a time.
             .child({
                 let hscroll_bounds = self.hscroll_bounds.clone();
                 div()
-                    .id("hscrollbar")
+                    .id("grid-scrollbar")
                     .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(6.0))
+                    .when(is_rows, |d| d.top_0().bottom_0().right_0().w(px(6.0)))
+                    .when(!is_rows, |d| d.bottom_0().left_0().right_0().h(px(6.0)))
                     .cursor(CursorStyle::Arrow)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
                             let max_offset = this.projects_scroll_handle.max_offset();
-                            if max_offset.x <= px(2.0) {
+                            let max = if is_rows { max_offset.y } else { max_offset.x };
+                            if max <= px(2.0) {
                                 return;
                             }
                             this.hscroll_dragging = true;
                             // Jump to clicked position
                             if let Some(bounds) = *this.hscroll_bounds.borrow() {
-                                let track_width = f32::from(bounds.size.width);
-                                let relative_x = f32::from(event.position.x) - f32::from(bounds.origin.x);
-                                let ratio = (relative_x / track_width).clamp(0.0, 1.0);
-                                let new_x = -ratio * f32::from(max_offset.x);
-                                this.projects_scroll_handle.set_offset(point(px(new_x), px(0.0)));
+                                let (track, origin, pos) = if is_rows {
+                                    (f32::from(bounds.size.height), f32::from(bounds.origin.y), f32::from(event.position.y))
+                                } else {
+                                    (f32::from(bounds.size.width), f32::from(bounds.origin.x), f32::from(event.position.x))
+                                };
+                                let ratio = ((pos - origin) / track).clamp(0.0, 1.0);
+                                let new = -ratio * f32::from(max);
+                                let off = if is_rows { point(px(0.0), px(new)) } else { point(px(new), px(0.0)) };
+                                this.projects_scroll_handle.set_offset(off);
                             }
                             cx.notify();
                         }),
                     )
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
                         if !this.hscroll_dragging {
                             return;
                         }
                         let max_offset = this.projects_scroll_handle.max_offset();
-                        if max_offset.x <= px(2.0) {
+                        let max = if is_rows { max_offset.y } else { max_offset.x };
+                        if max <= px(2.0) {
                             return;
                         }
                         if let Some(bounds) = *this.hscroll_bounds.borrow() {
-                            let track_width = f32::from(bounds.size.width);
-                            let relative_x = f32::from(event.position.x) - f32::from(bounds.origin.x);
-                            let ratio = (relative_x / track_width).clamp(0.0, 1.0);
-                            let new_x = -ratio * f32::from(max_offset.x);
-                            this.projects_scroll_handle.set_offset(point(px(new_x), px(0.0)));
+                            let (track, origin, pos) = if is_rows {
+                                (f32::from(bounds.size.height), f32::from(bounds.origin.y), f32::from(event.position.y))
+                            } else {
+                                (f32::from(bounds.size.width), f32::from(bounds.origin.x), f32::from(event.position.x))
+                            };
+                            let ratio = ((pos - origin) / track).clamp(0.0, 1.0);
+                            let new = -ratio * f32::from(max);
+                            let off = if is_rows { point(px(0.0), px(new)) } else { point(px(new), px(0.0)) };
+                            this.projects_scroll_handle.set_offset(off);
                         }
                         cx.notify();
                     }))
@@ -387,19 +435,32 @@ impl WindowView {
                         },
                         move |bounds, _, window, _cx| {
                             let max_scroll = scroll_handle.max_offset();
-                            if max_scroll.x <= px(2.0) {
+                            let max = if is_rows { max_scroll.y } else { max_scroll.x };
+                            if max <= px(2.0) {
                                 return;
                             }
                             let offset = scroll_handle.offset();
-                            let track_width = f32::from(bounds.size.width);
-                            let content_width = track_width + f32::from(max_scroll.x);
-                            let thumb_width = (track_width / content_width * track_width).max(30.0);
-                            let scroll_ratio = f32::from(-offset.x) / f32::from(max_scroll.x);
-                            let thumb_x = scroll_ratio * (track_width - thumb_width);
+                            let off = if is_rows { offset.y } else { offset.x };
+                            let track = if is_rows {
+                                f32::from(bounds.size.height)
+                            } else {
+                                f32::from(bounds.size.width)
+                            };
+                            let content = track + f32::from(max);
+                            let thumb = (track / content * track).max(30.0);
+                            let scroll_ratio = f32::from(-off) / f32::from(max);
+                            let thumb_pos = scroll_ratio * (track - thumb);
 
-                            let thumb_bounds = Bounds {
-                                origin: point(bounds.origin.x + px(thumb_x), bounds.origin.y + px(1.0)),
-                                size: size(px(thumb_width), px(4.0)),
+                            let thumb_bounds = if is_rows {
+                                Bounds {
+                                    origin: point(bounds.origin.x + px(1.0), bounds.origin.y + px(thumb_pos)),
+                                    size: size(px(4.0), px(thumb)),
+                                }
+                            } else {
+                                Bounds {
+                                    origin: point(bounds.origin.x + px(thumb_pos), bounds.origin.y + px(1.0)),
+                                    size: size(px(thumb), px(4.0)),
+                                }
                             };
                             window.paint_quad(fill(thumb_bounds, scrollbar_color).corner_radii(px(2.0)));
                         },
@@ -622,6 +683,15 @@ impl Render for WindowView {
                     }
                     // Equalize pane sizes in the focused terminal's parent split
                     ws.equalize_focused_split(&fm, cx);
+                });
+            }))
+            // Toggle this window's project grid between columns and rows.
+            // Per-window setting persisted on WindowState; sizing percentages
+            // carry over unchanged across the flip.
+            .on_action(cx.listener(|this, _: &ToggleProjectLayout, _window, cx| {
+                let window_id = this.window_id;
+                this.workspace.update(cx, |ws, cx| {
+                    ws.toggle_project_layout_mode(window_id, cx);
                 });
             }))
             // Spawn a new extra window onto the workspace. The data-layer

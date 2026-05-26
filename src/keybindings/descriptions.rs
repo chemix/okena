@@ -11,7 +11,7 @@ use super::{
     ShowContentSearch, ShowFileSearch, ShowHookLog, ShowLogConsole, ShowKeybindings, ShowProjectSwitcher, ShowSessionManager,
     ShowSettings, ShowThemeSelector, SplitHorizontal, SplitVertical, StartAllServices,
     StopAllServices, ToggleFullscreen, TogglePaneSwitcher, ToggleSidebar, ToggleSidebarAutoHide,
-    ZoomIn, ZoomOut, EqualizeLayout, ShowBranchSwitcher, ShowProfileManager,
+    ZoomIn, ZoomOut, EqualizeLayout, ToggleProjectLayout, ShowBranchSwitcher, ShowProfileManager,
 };
 
 /// Get human-readable descriptions for all actions
@@ -538,6 +538,15 @@ pub fn get_action_descriptions() -> HashMap<&'static str, ActionDescription> {
             description: "Equalize columns and panes to match the focused one",
             category: "Layout",
             factory: || Box::new(EqualizeLayout),
+        },
+    );
+    map.insert(
+        "ToggleProjectLayout",
+        ActionDescription {
+            name: "Toggle Project Layout",
+            description: "Switch the project grid between columns and rows",
+            category: "Layout",
+            factory: || Box::new(ToggleProjectLayout),
         },
     );
     map.insert(

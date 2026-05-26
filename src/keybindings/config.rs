@@ -305,6 +305,14 @@ impl KeybindingConfig {
         );
 
         bindings.insert(
+            "ToggleProjectLayout".to_string(),
+            vec![
+                KeybindingEntry::new("cmd-shift-l", None),
+                KeybindingEntry::new("ctrl-shift-l", None),
+            ],
+        );
+
+        bindings.insert(
             "ShowBranchSwitcher".to_string(),
             vec![
                 KeybindingEntry::new("cmd-alt-b", None),
