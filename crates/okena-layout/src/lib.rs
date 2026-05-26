@@ -71,6 +71,29 @@ impl LayoutNode {
         }
     }
 
+    /// Recursively flip every `Split` in this subtree between horizontal and
+    /// vertical. `Tabs` and `Terminal` nodes are unaffected (tabs have no
+    /// orientation), but the walk descends into both so nested splits inside
+    /// tab groups are transposed too. `sizes` are preserved as-is — they are
+    /// fractions along the split axis, so a 60/40 horizontal split becomes a
+    /// 60/40 vertical split.
+    pub fn transpose(&mut self) {
+        match self {
+            LayoutNode::Terminal { .. } => {}
+            LayoutNode::Split { direction, children, .. } => {
+                *direction = direction.flipped();
+                for child in children {
+                    child.transpose();
+                }
+            }
+            LayoutNode::Tabs { children, .. } => {
+                for child in children {
+                    child.transpose();
+                }
+            }
+        }
+    }
+
     /// Create a new empty terminal node
     pub fn new_terminal() -> Self {
         LayoutNode::Terminal {
@@ -793,6 +816,33 @@ mod tests {
             shell_type: ShellType::Default,
             zoom_level: 1.0,
         }
+    }
+
+    #[test]
+    fn transpose_flips_nested_splits_through_tabs() {
+        // Every Split flips H<->V recursively, descending through Tabs (which
+        // have no orientation of their own). Terminals are untouched.
+        let mut tree = hsplit(vec![
+            terminal("a"),
+            LayoutNode::Tabs {
+                children: vec![vsplit(vec![terminal("b"), terminal("c")])],
+                active_tab: 0,
+            },
+        ]);
+        tree.transpose();
+
+        let LayoutNode::Split { direction, children, .. } = &tree else {
+            panic!("expected split");
+        };
+        assert_eq!(*direction, SplitDirection::Vertical);
+        let LayoutNode::Tabs { children: tab_children, active_tab } = &children[1] else {
+            panic!("expected tabs");
+        };
+        assert_eq!(*active_tab, 0, "tab structure preserved");
+        let LayoutNode::Split { direction: inner, .. } = &tab_children[0] else {
+            panic!("expected nested split inside tabs");
+        };
+        assert_eq!(*inner, SplitDirection::Horizontal, "nested split flipped");
     }
 
     fn hsplit(children: Vec<LayoutNode>) -> LayoutNode {

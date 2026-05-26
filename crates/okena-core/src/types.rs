@@ -7,6 +7,16 @@ pub enum SplitDirection {
     Vertical,
 }
 
+impl SplitDirection {
+    /// Return the perpendicular direction (Horizontal <-> Vertical).
+    pub fn flipped(self) -> Self {
+        match self {
+            SplitDirection::Horizontal => SplitDirection::Vertical,
+            SplitDirection::Vertical => SplitDirection::Horizontal,
+        }
+    }
+}
+
 /// Display mode for the diff viewer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffViewMode {
