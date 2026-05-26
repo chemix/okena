@@ -31,7 +31,7 @@ const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_LINES: usize = 10000;
 
 /// Maximum number of open tabs
-const MAX_TABS: usize = 20;
+const MAX_TABS: usize = 50;
 
 /// Maximum navigation history stack size
 const MAX_HISTORY: usize = 50;
@@ -683,18 +683,34 @@ impl FileViewer {
         let current = self.active_tab().relative_path.clone();
         self.history.push(&current);
 
-        if self.tabs.len() >= MAX_TABS {
-            // At limit: replace the active tab
-            self.tabs[self.active_tab] = new_tab;
-        } else {
-            // Insert new tab after active
-            let insert_at = self.active_tab + 1;
-            self.tabs.insert(insert_at, new_tab);
-            self.active_tab = insert_at;
-        }
+        self.active_tab = Self::insert_tab_after_active(&mut self.tabs, self.active_tab, new_tab);
 
         self.spawn_tab_load(relative_path, cx);
         cx.notify();
+    }
+
+    /// Insert `new_tab` directly after the active tab and return the new
+    /// active index (the inserted tab). When already at `MAX_TABS`, the oldest
+    /// tab is evicted first to make room — never the active tab, so the file
+    /// the user is looking at is preserved. Evicting a tab before the active
+    /// one shifts the active index left by one.
+    fn insert_tab_after_active(
+        tabs: &mut Vec<FileViewerTab>,
+        active: usize,
+        new_tab: FileViewerTab,
+    ) -> usize {
+        let mut active = active;
+        if tabs.len() >= MAX_TABS {
+            // Oldest tab is index 0; skip it only if it's the active tab.
+            let evict = if active == 0 { 1 } else { 0 };
+            tabs.remove(evict);
+            if evict < active {
+                active -= 1;
+            }
+        }
+        let insert_at = active + 1;
+        tabs.insert(insert_at, new_tab);
+        insert_at
     }
 
     /// Mark all ancestor folders of `relative_path` as expanded and ensure
@@ -887,7 +903,51 @@ impl Focusable for FileViewer {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileViewer, NavigationHistory};
+    use super::{FileViewer, FileViewerTab, NavigationHistory, MAX_TABS};
+
+    fn tab(name: &str) -> FileViewerTab {
+        FileViewerTab::new_loading(name.to_string(), name.into())
+    }
+
+    fn paths(tabs: &[FileViewerTab]) -> Vec<&str> {
+        tabs.iter().map(|t| t.relative_path.as_str()).collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn insert_tab_below_limit_inserts_after_active() {
+        let mut tabs = vec![tab("a"), tab("b"), tab("c")];
+        let active = FileViewer::insert_tab_after_active(&mut tabs, 0, tab("new"));
+        assert_eq!(active, 1);
+        assert_eq!(paths(&tabs), ["a", "new", "b", "c"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn insert_tab_at_limit_evicts_oldest_and_keeps_active() {
+        let mut tabs: Vec<FileViewerTab> =
+            (0..MAX_TABS).map(|i| tab(&format!("f{i}"))).collect();
+        // Active is somewhere in the middle.
+        let active = FileViewer::insert_tab_after_active(&mut tabs, 10, tab("new"));
+        assert_eq!(tabs.len(), MAX_TABS);
+        // Oldest (index 0) was evicted; everything shifted left by one, so the
+        // active file f10 stays active and the new tab lands right after it.
+        assert_eq!(tabs[0].relative_path, "f1");
+        assert_eq!(tabs[active - 1].relative_path, "f10");
+        assert_eq!(tabs[active].relative_path, "new");
+    }
+
+    #[::core::prelude::v1::test]
+    fn insert_tab_at_limit_skips_active_when_active_is_oldest() {
+        let mut tabs: Vec<FileViewerTab> =
+            (0..MAX_TABS).map(|i| tab(&format!("f{i}"))).collect();
+        // Active IS the oldest tab — must not evict it.
+        let active = FileViewer::insert_tab_after_active(&mut tabs, 0, tab("new"));
+        assert_eq!(tabs.len(), MAX_TABS);
+        assert_eq!(active, 1);
+        // f0 (active) preserved at index 0; f1 (next oldest) evicted.
+        assert_eq!(tabs[0].relative_path, "f0");
+        assert_eq!(tabs[1].relative_path, "new");
+        assert_eq!(tabs[2].relative_path, "f2");
+    }
 
     #[::core::prelude::v1::test]
     fn test_compute_expanded_root_file() {
