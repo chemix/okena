@@ -29,3 +29,5 @@ uuid = { version = "1.10", features = ["v4"] }
 log = "0.4"
 anyhow = "1.0"
 regex = "1.10"
+# Decoding base64 payloads in the OSC 99 (kitty) notification protocol.
+base64 = "0.22"

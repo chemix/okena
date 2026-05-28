@@ -1,5 +1,7 @@
 use alacritty_terminal::vte::Perform;
+use base64::Engine as _;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::app_version::app_version;
@@ -7,19 +9,35 @@ use super::transport::TerminalTransport;
 
 /// A desktop notification requested by the shell via an OSC escape.
 ///
-/// Two source sequences map onto this type:
+/// Three source sequences map onto this type:
 /// - iTerm2-style `OSC 9 ; <body>` — a single message with no title.
 /// - `OSC 777 ; notify ; <title> ; <body>` (urxvt / foot / wezterm) — a
 ///   proper title + body pair.
+/// - `OSC 99` — the kitty notification protocol; title and body arrive across
+///   one or more chunks (see [`Osc99Accumulator`]).
 ///
 /// The GPUI thread drains these via [`super::Terminal::take_pending_notifications`]
 /// and turns them into native desktop notifications.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalNotification {
-    /// Present only for `OSC 777`; `OSC 9` notifications carry a body alone,
-    /// leaving the consumer to pick a title (e.g. the project name).
+    /// `None` for `OSC 9` (and title-less `OSC 99`), where the consumer picks
+    /// a title (e.g. the project name); `Some` for `OSC 777` and `OSC 99`
+    /// notifications that carry a distinct title and body.
     pub title: Option<String>,
     pub body: String,
+}
+
+/// Cap on accumulated `OSC 99` title/body length and number of in-flight
+/// (incomplete, `d=0`) notifications, to bound memory against a misbehaving
+/// stream that never sends a final chunk.
+const OSC99_MAX_FIELD_LEN: usize = 4096;
+const OSC99_MAX_PENDING: usize = 32;
+
+/// Reassembly buffer for a chunked `OSC 99` notification keyed by its `i=` id.
+#[derive(Default)]
+struct Osc99Accumulator {
+    title: String,
+    body: String,
 }
 
 /// Side-channel VTE parser for sequences that alacritty_terminal either
@@ -46,6 +64,7 @@ impl OscSidecar {
                 pending_notifications,
                 transport,
                 terminal_id,
+                osc99_pending: HashMap::new(),
             },
         }
     }
@@ -57,11 +76,125 @@ impl OscSidecar {
 
 struct SidecarPerform {
     reported_cwd: Arc<Mutex<Option<String>>>,
-    /// `OSC 9` / `OSC 777` notifications, drained by the GPUI thread in the
-    /// PTY event loop (same model as `pending_clipboard`).
+    /// `OSC 9` / `OSC 777` / `OSC 99` notifications, drained by the GPUI thread
+    /// in the PTY event loop (same model as `pending_clipboard`).
     pending_notifications: Arc<Mutex<Vec<TerminalNotification>>>,
     transport: Arc<dyn TerminalTransport>,
     terminal_id: String,
+    /// In-progress `OSC 99` notifications keyed by `i=` id, awaiting their
+    /// final (`d=1`) chunk. GPUI-thread only (process_output is serialized).
+    osc99_pending: HashMap<String, Osc99Accumulator>,
+}
+
+impl SidecarPerform {
+    /// Handle the kitty notification protocol: `OSC 99 ; metadata ; payload`.
+    ///
+    /// `metadata` is colon-separated `key=value` pairs (ASCII). We care about:
+    /// `i` (id, groups chunks), `d` (0 = more chunks, default 1 = complete),
+    /// `p` (`title` default / `body` / others we ignore), `e` (1 = payload is
+    /// base64), and `c=1` (close). Title/body payloads accumulate per id until
+    /// a final chunk, then emit one [`TerminalNotification`]. Non-text payload
+    /// types (queries, icons, buttons, …) are ignored.
+    fn handle_osc99(&mut self, params: &[&[u8]]) {
+        let metadata: &[u8] = params.get(1).copied().unwrap_or(b"");
+        // Payload may contain ';' when unencoded → rejoin the split tail.
+        let payload_raw: String = params
+            .get(2..)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| std::str::from_utf8(p).ok())
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let mut id = String::new();
+        let mut done = true; // `d` defaults to 1 (complete)
+        let mut ptype = "title"; // `p` defaults to title
+        let mut base64 = false;
+        let mut close = false;
+        for field in metadata.split(|&b| b == b':') {
+            let mut kv = field.splitn(2, |&b| b == b'=');
+            let key = kv.next().unwrap_or(b"");
+            let val = kv.next().unwrap_or(b"");
+            match key {
+                b"i" => id = String::from_utf8_lossy(val).into_owned(),
+                b"d" => done = val != b"0",
+                b"p" => ptype = std::str::from_utf8(val).unwrap_or("title"),
+                b"e" => base64 = val == b"1",
+                b"c" => close = val == b"1",
+                _ => {}
+            }
+        }
+
+        // Close request: drop any in-progress accumulation, display nothing.
+        if close || ptype == "close" {
+            self.osc99_pending.remove(&id);
+            return;
+        }
+
+        // Only title/body payloads build a displayed notification. Other types
+        // (query `?`, icon, buttons, alive, …) don't contribute text, but a
+        // final chunk still completes whatever was accumulated.
+        if ptype != "title" && ptype != "body" {
+            if done {
+                self.finish_osc99(&id);
+            }
+            return;
+        }
+
+        let payload = if base64 {
+            // kitty uses standard base64; tolerate a missing-pad variant too.
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(payload_raw.as_bytes())
+                .or_else(|_| {
+                    base64::engine::general_purpose::STANDARD_NO_PAD
+                        .decode(payload_raw.as_bytes())
+                });
+            match decoded.ok().and_then(|b| String::from_utf8(b).ok()) {
+                Some(s) => s,
+                None => return, // undecodable chunk — drop it
+            }
+        } else {
+            payload_raw
+        };
+
+        // Bound memory: ignore a brand-new id once too many are in flight.
+        if !self.osc99_pending.contains_key(&id)
+            && self.osc99_pending.len() >= OSC99_MAX_PENDING
+        {
+            return;
+        }
+        let acc = self.osc99_pending.entry(id.clone()).or_default();
+        let target = if ptype == "body" { &mut acc.body } else { &mut acc.title };
+        if target.len() + payload.len() <= OSC99_MAX_FIELD_LEN {
+            target.push_str(&payload);
+        }
+
+        if done {
+            self.finish_osc99(&id);
+        }
+    }
+
+    /// Finalize the accumulated `OSC 99` notification for `id` and queue it.
+    /// kitty's "title" is the headline, so a title-only notification reads like
+    /// `OSC 9` (the consumer supplies the title, e.g. the project name).
+    fn finish_osc99(&mut self, id: &str) {
+        let Some(acc) = self.osc99_pending.remove(id) else {
+            return;
+        };
+        let title = acc.title.trim();
+        let body = acc.body.trim();
+        let notification = if !body.is_empty() {
+            TerminalNotification {
+                title: (!title.is_empty()).then(|| title.to_string()),
+                body: body.to_string(),
+            }
+        } else if !title.is_empty() {
+            TerminalNotification { title: None, body: title.to_string() }
+        } else {
+            return; // nothing to show
+        };
+        self.pending_notifications.lock().push(notification);
+    }
 }
 
 impl Perform for SidecarPerform {
@@ -131,6 +264,7 @@ impl Perform for SidecarPerform {
                     });
                 }
             }
+            b"99" => self.handle_osc99(params),
             _ => {}
         }
     }

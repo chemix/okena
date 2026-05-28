@@ -345,6 +345,81 @@ fn test_osc777_non_notify_subcommand_ignored() {
 }
 
 #[test]
+fn test_osc99_simple_single_chunk() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // Minimal kitty form: empty metadata, payload is the (title) text. With no
+    // body it maps to a title-less notification, like OSC 9.
+    terminal.process_output(b"\x1b]99;;Hello world\x07");
+
+    assert_eq!(
+        terminal.take_pending_notifications(),
+        vec![TerminalNotification { title: None, body: "Hello world".to_string() }],
+    );
+}
+
+#[test]
+fn test_osc99_title_and_body_chunks() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // First chunk: title, d=0 (not complete) → nothing displayed yet.
+    terminal.process_output(b"\x1b]99;i=x:d=0;My Title\x07");
+    assert!(terminal.take_pending_notifications().is_empty(), "d=0 must not emit");
+
+    // Second chunk: body, d defaults to 1 (complete) → emit assembled pair.
+    terminal.process_output(b"\x1b]99;i=x:p=body;Body text\x07");
+    assert_eq!(
+        terminal.take_pending_notifications(),
+        vec![TerminalNotification {
+            title: Some("My Title".to_string()),
+            body: "Body text".to_string(),
+        }],
+    );
+}
+
+#[test]
+fn test_osc99_base64_payload() {
+    use base64::Engine as _;
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode("Encoded msg");
+    terminal.process_output(format!("\x1b]99;e=1;{encoded}\x07").as_bytes());
+
+    assert_eq!(
+        terminal.take_pending_notifications(),
+        vec![TerminalNotification { title: None, body: "Encoded msg".to_string() }],
+    );
+}
+
+#[test]
+fn test_osc99_close_drops_pending() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // Start a chunked notification, then close it before completion.
+    terminal.process_output(b"\x1b]99;i=x:d=0;Partial\x07");
+    terminal.process_output(b"\x1b]99;i=x:c=1;\x07");
+    assert!(terminal.take_pending_notifications().is_empty());
+
+    // A subsequent final chunk for the same id has nothing to complete.
+    terminal.process_output(b"\x1b]99;i=x:d=1;\x07");
+    assert!(terminal.take_pending_notifications().is_empty());
+}
+
+#[test]
+fn test_osc99_query_payload_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // A capability query (p=?) carries no displayable text.
+    terminal.process_output(b"\x1b]99;p=?;\x07");
+    assert!(terminal.take_pending_notifications().is_empty());
+}
+
+#[test]
 fn test_bell_edge_is_one_shot() {
     let transport = Arc::new(NullTransport);
     let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
