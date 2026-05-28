@@ -12,7 +12,7 @@ use crate::layout::navigation::register_pane_bounds;
 use okena_workspace::state::{WindowId, Workspace};
 use gpui::*;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::Scrollbar;
 use super::url_detector::UrlDetector;
@@ -47,6 +47,10 @@ pub struct TerminalContent {
     scroll_accumulator: f32,
     mouse_down_cell: Option<(usize, i32)>,
     forwarded_button: Option<(u8, u8)>,
+    /// Runs while a drag-selection is active, scrolling the viewport when the
+    /// pointer is held past the top/bottom edge so selection can extend beyond
+    /// the visible area (issue #132).
+    autoscroll_task: Option<Task<()>>,
 }
 
 impl TerminalContent {
@@ -80,6 +84,7 @@ impl TerminalContent {
             scroll_accumulator: 0.0,
             mouse_down_cell: None,
             forwarded_button: None,
+            autoscroll_task: None,
         }
     }
 
@@ -360,7 +365,68 @@ impl TerminalContent {
                 self.is_selecting = true;
             }
         }
+        if self.is_selecting {
+            self.start_autoscroll(window, cx);
+        }
         cx.notify();
+    }
+
+    /// Spawn the drag-selection auto-scroll loop. It keeps the viewport
+    /// scrolling toward the pointer while the user holds the mouse past the
+    /// terminal's top/bottom edge — including when the pointer leaves the
+    /// element entirely, where `on_mouse_move` no longer fires (issue #132).
+    fn start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let interval = Duration::from_millis(33);
+            loop {
+                smol::Timer::after(interval).await;
+                match this.update_in(cx, |this, window, cx| this.autoscroll_tick(window, cx)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        }));
+    }
+
+    /// One tick of the auto-scroll loop. Returns `false` to stop the loop.
+    /// Scrolls (and extends the selection) only while the pointer is past an
+    /// edge; the in-bounds case is already handled by `handle_mouse_move`.
+    fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.is_selecting {
+            return false;
+        }
+        let Some(bounds) = self.element_bounds else {
+            return false;
+        };
+        let Some(terminal) = self.terminal.clone() else {
+            return false;
+        };
+
+        let position = window.mouse_position();
+        let (_cell_width, cell_height) = terminal.cell_dimensions();
+
+        let top = f32::from(bounds.origin.y) + Self::TERMINAL_PADDING;
+        let bottom =
+            f32::from(bounds.origin.y) + f32::from(bounds.size.height) - Self::TERMINAL_PADDING;
+        let y = f32::from(position.y);
+
+        let lines = autoscroll_lines(y, top, bottom, cell_height);
+        if lines == 0 {
+            return true;
+        }
+
+        if lines > 0 {
+            terminal.scroll_up(lines);
+        } else if lines < 0 {
+            terminal.scroll_down(-lines);
+        }
+
+        if let Some((col, row, side)) = self.pixel_to_cell(position) {
+            terminal.update_selection(col, row, side);
+        }
+        self.mark_scroll_activity(cx);
+        cx.notify();
+        true
     }
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -661,3 +727,67 @@ impl Drop for TerminalContent {
 }
 
 impl EventEmitter<TerminalContentEvent> for TerminalContent {}
+
+/// Lines to scroll for drag-selection auto-scroll, given the pointer's `y` and
+/// the terminal content's `top`/`bottom` edges (all window-space pixels).
+///
+/// Returns 0 while the pointer is between the edges. Past an edge the magnitude
+/// grows super-linearly with distance (a far drag scrolls fast) but is capped at
+/// ±3 lines per tick so a flick can't jump pages. Positive scrolls up toward
+/// history, negative scrolls down toward the prompt. Matches Zed's terminal.
+fn autoscroll_lines(y: f32, top: f32, bottom: f32, cell_height: f32) -> i32 {
+    if cell_height <= 0.0 {
+        return 0;
+    }
+    let lines = if y < top {
+        ((top - y).powf(1.1) / cell_height).ceil() as i32
+    } else if y > bottom {
+        -(((y - bottom).powf(1.1) / cell_height).ceil() as i32)
+    } else {
+        0
+    };
+    lines.clamp(-3, 3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::autoscroll_lines;
+
+    const CELL: f32 = 16.0;
+    const TOP: f32 = 100.0;
+    const BOTTOM: f32 = 500.0;
+
+    #[test]
+    fn no_scroll_within_bounds() {
+        assert_eq!(autoscroll_lines(TOP, TOP, BOTTOM, CELL), 0);
+        assert_eq!(autoscroll_lines(300.0, TOP, BOTTOM, CELL), 0);
+        assert_eq!(autoscroll_lines(BOTTOM, TOP, BOTTOM, CELL), 0);
+    }
+
+    #[test]
+    fn scrolls_up_past_top_edge() {
+        // Just above the top edge: one line toward history.
+        assert_eq!(autoscroll_lines(TOP - 1.0, TOP, BOTTOM, CELL), 1);
+        // Far above the top: clamped to the +3 ceiling.
+        assert_eq!(autoscroll_lines(TOP - 1000.0, TOP, BOTTOM, CELL), 3);
+    }
+
+    #[test]
+    fn scrolls_down_past_bottom_edge() {
+        assert_eq!(autoscroll_lines(BOTTOM + 1.0, TOP, BOTTOM, CELL), -1);
+        assert_eq!(autoscroll_lines(BOTTOM + 1000.0, TOP, BOTTOM, CELL), -3);
+    }
+
+    #[test]
+    fn magnitude_is_clamped_to_three_lines() {
+        for dy in [50.0_f32, 100.0, 500.0, 5000.0] {
+            assert!((1..=3).contains(&autoscroll_lines(TOP - dy, TOP, BOTTOM, CELL)));
+            assert!((-3..=-1).contains(&autoscroll_lines(BOTTOM + dy, TOP, BOTTOM, CELL)));
+        }
+    }
+
+    #[test]
+    fn zero_cell_height_is_safe() {
+        assert_eq!(autoscroll_lines(TOP - 50.0, TOP, BOTTOM, 0.0), 0);
+    }
+}
