@@ -43,6 +43,8 @@ pub use types::{
     TerminalSize,
 };
 
+pub use osc_sidecar::TerminalNotification;
+
 use event_listener::ZedEventListener;
 use osc_sidecar::OscSidecar;
 use prompt_marks::{PromptSidecar, PromptTracker};
@@ -143,6 +145,12 @@ pub struct Terminal {
     /// GPUI thread only.
     pub(super) has_bell: Arc<Mutex<bool>>,
 
+    /// One-shot "the bell rang since last drain" edge. `Arc` shared with
+    /// `ZedEventListener`: set on BEL alongside `has_bell`, consumed (swapped
+    /// to false) by the PTY event loop so a bell raises a desktop notification
+    /// exactly once instead of on every batch while `has_bell` stays set.
+    pub(super) bell_pending: Arc<AtomicBool>,
+
     /// Pending OSC 52 clipboard writes requested by the running app. `Arc`
     /// shared with `ZedEventListener`: pushed during `process_output`,
     /// drained by the GPUI render path via `drain_clipboard_writes`.
@@ -161,10 +169,11 @@ pub struct Terminal {
     /// parse, GPUI reads via `reported_cwd`). GPUI thread only.
     pub(super) reported_cwd: Arc<Mutex<Option<String>>>,
 
-    /// Pending iTerm2-style `OSC 9` notifications. `Arc` shared with
+    /// Pending `OSC 9` / `OSC 777` desktop notifications. `Arc` shared with
     /// `OscSidecar`: pushed during `process_output`, drained by the GPUI
-    /// render path via `drain_notifications`. GPUI thread only.
-    pub(super) pending_notifications: Arc<Mutex<Vec<String>>>,
+    /// thread in the PTY event loop via `take_pending_notifications`. GPUI
+    /// thread only.
+    pub(super) pending_notifications: Arc<Mutex<Vec<TerminalNotification>>>,
 
     /// Per-renderer focus state for DEC focus reports. A terminal can appear
     /// in multiple windows, so focus reports are derived from the aggregate
@@ -288,11 +297,13 @@ impl Terminal {
         // Create shared storage for OSC sequence handling and bell
         let title = Arc::new(Mutex::new(None));
         let has_bell = Arc::new(Mutex::new(false));
+        let bell_pending = Arc::new(AtomicBool::new(false));
         let pending_clipboard = Arc::new(Mutex::new(Vec::new()));
         let palette = Arc::new(Mutex::new(None));
         let event_listener = ZedEventListener::new(
             title.clone(),
             has_bell.clone(),
+            bell_pending.clone(),
             pending_clipboard.clone(),
             palette.clone(),
             transport.clone(),
@@ -319,6 +330,7 @@ impl Terminal {
             scroll_offset: Mutex::new(0),
             title,
             has_bell,
+            bell_pending,
             pending_clipboard,
             palette,
             pending_output: Mutex::new(Vec::new()),

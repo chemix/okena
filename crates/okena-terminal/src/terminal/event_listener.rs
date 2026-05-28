@@ -1,6 +1,7 @@
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::transport::TerminalTransport;
 
@@ -8,8 +9,12 @@ use super::transport::TerminalTransport;
 pub struct ZedEventListener {
     /// Shared title storage - OSC 0/1/2 sequences update this
     title: Arc<Mutex<Option<String>>>,
-    /// Bell notification flag
+    /// Sticky bell flag for the UI (red border / sidebar dot), cleared on focus.
     has_bell: Arc<Mutex<bool>>,
+    /// One-shot "the bell rang since the last drain" edge, consumed by the PTY
+    /// event loop to fire a desktop notification exactly once per bell rather
+    /// than on every batch while `has_bell` stays set.
+    bell_pending: Arc<AtomicBool>,
     /// Pending OSC 52 clipboard writes to be picked up by the GPUI thread
     pending_clipboard: Arc<Mutex<Vec<String>>>,
     /// Current theme palette, pushed from the GPUI thread on each render.
@@ -25,12 +30,13 @@ impl ZedEventListener {
     pub fn new(
         title: Arc<Mutex<Option<String>>>,
         has_bell: Arc<Mutex<bool>>,
+        bell_pending: Arc<AtomicBool>,
         pending_clipboard: Arc<Mutex<Vec<String>>>,
         palette: Arc<Mutex<Option<okena_core::theme::ThemeColors>>>,
         transport: Arc<dyn TerminalTransport>,
         terminal_id: String,
     ) -> Self {
-        Self { title, has_bell, pending_clipboard, palette, transport, terminal_id }
+        Self { title, has_bell, bell_pending, pending_clipboard, palette, transport, terminal_id }
     }
 
     /// Resolve a color index (as passed by alacritty on a color query) to an
@@ -110,6 +116,7 @@ impl EventListener for ZedEventListener {
             }
             TermEvent::Bell => {
                 *self.has_bell.lock() = true;
+                self.bell_pending.store(true, Ordering::Relaxed);
             }
             TermEvent::ClipboardStore(_, text) => {
                 self.pending_clipboard.lock().push(text);

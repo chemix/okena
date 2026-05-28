@@ -1,4 +1,5 @@
 use super::super::Terminal;
+use super::super::TerminalNotification;
 use super::super::app_version::set_app_version;
 use super::super::osc_sidecar::parse_osc7_file_uri;
 use super::super::types::{PromptMarkKind, TerminalSize};
@@ -199,6 +200,11 @@ fn test_osc_title_reset() {
     assert!(title.is_none() || title.as_deref() == Some(""), "title should be empty or None, got: {:?}", title);
 }
 
+/// A title-less notification, the shape `OSC 9` produces.
+fn body(text: &str) -> TerminalNotification {
+    TerminalNotification { title: None, body: text.to_string() }
+}
+
 #[test]
 fn test_osc9_notification_collected() {
     let transport = Arc::new(NullTransport);
@@ -212,7 +218,7 @@ fn test_osc9_notification_collected() {
     terminal.process_output(b"\x1b]9;Build complete\x07");
 
     let pending = terminal.take_pending_notifications();
-    assert_eq!(pending, vec!["Build complete".to_string()]);
+    assert_eq!(pending, vec![body("Build complete")]);
     // Second drain is empty (consumed).
     assert!(terminal.take_pending_notifications().is_empty());
 }
@@ -231,7 +237,7 @@ fn test_osc9_multiple_notifications_queued() {
 
     assert_eq!(
         terminal.take_pending_notifications(),
-        vec!["first".to_string(), "second".to_string()],
+        vec![body("first"), body("second")],
     );
 }
 
@@ -268,7 +274,7 @@ fn test_osc9_split_across_chunks() {
 
     assert_eq!(
         terminal.take_pending_notifications(),
-        vec!["Long running job done".to_string()],
+        vec![body("Long running job done")],
     );
 }
 
@@ -287,8 +293,71 @@ fn test_osc9_st_terminator() {
 
     assert_eq!(
         terminal.take_pending_notifications(),
-        vec!["hello".to_string()],
+        vec![body("hello")],
     );
+}
+
+#[test]
+fn test_osc777_notify_title_and_body() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // urxvt-style: OSC 777 ; notify ; <title> ; <body>
+    terminal.process_output(b"\x1b]777;notify;Claude;Waiting for your input\x07");
+
+    assert_eq!(
+        terminal.take_pending_notifications(),
+        vec![TerminalNotification {
+            title: Some("Claude".to_string()),
+            body: "Waiting for your input".to_string(),
+        }],
+    );
+}
+
+#[test]
+fn test_osc777_body_keeps_semicolons() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // A body containing semicolons must be rejoined, not truncated.
+    terminal.process_output(b"\x1b]777;notify;Build;done: a; b; c\x07");
+
+    assert_eq!(
+        terminal.take_pending_notifications(),
+        vec![TerminalNotification {
+            title: Some("Build".to_string()),
+            body: "done: a; b; c".to_string(),
+        }],
+    );
+}
+
+#[test]
+fn test_osc777_non_notify_subcommand_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // 777 carries unrelated subcommands (e.g. precmd) — those must not queue.
+    terminal.process_output(b"\x1b]777;precmd;something\x07");
+    // ...and a notify with an empty body is dropped, like empty OSC 9.
+    terminal.process_output(b"\x1b]777;notify;TitleOnly\x07");
+
+    assert!(terminal.take_pending_notifications().is_empty());
+}
+
+#[test]
+fn test_bell_edge_is_one_shot() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    assert!(!terminal.take_pending_bell(), "no bell yet");
+
+    // A lone BEL (0x07) rings the bell.
+    terminal.process_output(b"\x07");
+    assert!(terminal.take_pending_bell(), "edge fires once");
+    assert!(!terminal.take_pending_bell(), "edge is consumed (one-shot)");
+
+    // The sticky UI flag is independent of the one-shot notification edge.
+    assert!(terminal.has_bell(), "has_bell stays set until focus clears it");
 }
 
 #[test]

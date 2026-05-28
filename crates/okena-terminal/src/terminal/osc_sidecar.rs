@@ -5,6 +5,23 @@ use std::sync::Arc;
 use super::app_version::app_version;
 use super::transport::TerminalTransport;
 
+/// A desktop notification requested by the shell via an OSC escape.
+///
+/// Two source sequences map onto this type:
+/// - iTerm2-style `OSC 9 ; <body>` — a single message with no title.
+/// - `OSC 777 ; notify ; <title> ; <body>` (urxvt / foot / wezterm) — a
+///   proper title + body pair.
+///
+/// The GPUI thread drains these via [`super::Terminal::take_pending_notifications`]
+/// and turns them into native desktop notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalNotification {
+    /// Present only for `OSC 777`; `OSC 9` notifications carry a body alone,
+    /// leaving the consumer to pick a title (e.g. the project name).
+    pub title: Option<String>,
+    pub body: String,
+}
+
 /// Side-channel VTE parser for sequences that alacritty_terminal either
 /// ignores or answers in a way Okena wants to override. Runs on the same
 /// byte stream as the main `Processor` so we can observe shell-reported
@@ -18,7 +35,7 @@ pub(crate) struct OscSidecar {
 impl OscSidecar {
     pub(super) fn new(
         reported_cwd: Arc<Mutex<Option<String>>>,
-        pending_notifications: Arc<Mutex<Vec<String>>>,
+        pending_notifications: Arc<Mutex<Vec<TerminalNotification>>>,
         transport: Arc<dyn TerminalTransport>,
         terminal_id: String,
     ) -> Self {
@@ -40,9 +57,9 @@ impl OscSidecar {
 
 struct SidecarPerform {
     reported_cwd: Arc<Mutex<Option<String>>>,
-    /// iTerm2-style `OSC 9 ; <message>` notifications, drained by the GPUI
-    /// thread on each render (same model as `pending_clipboard`).
-    pending_notifications: Arc<Mutex<Vec<String>>>,
+    /// `OSC 9` / `OSC 777` notifications, drained by the GPUI thread in the
+    /// PTY event loop (same model as `pending_clipboard`).
+    pending_notifications: Arc<Mutex<Vec<TerminalNotification>>>,
     transport: Arc<dyn TerminalTransport>,
     terminal_id: String,
 }
@@ -79,7 +96,39 @@ impl Perform for SidecarPerform {
                     .join(";");
                 let message = message.trim();
                 if !message.is_empty() {
-                    self.pending_notifications.lock().push(message.to_string());
+                    self.pending_notifications.lock().push(TerminalNotification {
+                        title: None,
+                        body: message.to_string(),
+                    });
+                }
+            }
+            b"777" => {
+                // urxvt-style rich notification: `OSC 777 ; notify ; title ; body`.
+                // 777 also carries unrelated subcommands (e.g. precmd/preexec
+                // from some prompt frameworks) — only `notify` is ours.
+                if params.get(1).copied() != Some(b"notify".as_slice()) {
+                    return;
+                }
+                let title = params
+                    .get(2)
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .unwrap_or("")
+                    .trim();
+                // The body may legitimately contain semicolons, so rejoin the
+                // tail. `get(3..)` avoids a panic when no body field is present.
+                let body: String = params
+                    .get(3..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|p| std::str::from_utf8(p).ok())
+                    .collect::<Vec<_>>()
+                    .join(";");
+                let body = body.trim();
+                if !body.is_empty() {
+                    self.pending_notifications.lock().push(TerminalNotification {
+                        title: (!title.is_empty()).then(|| title.to_string()),
+                        body: body.to_string(),
+                    });
                 }
             }
             _ => {}

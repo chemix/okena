@@ -19,11 +19,11 @@ impl Terminal {
         std::mem::take(&mut *self.pending_clipboard.lock())
     }
 
-    /// Take any pending iTerm2-style `OSC 9 ; message` notifications. The
-    /// GPUI thread drains these on each render to surface toasts or native
-    /// desktop notifications for long-running commands that finished while
-    /// the user was in another pane.
-    pub fn take_pending_notifications(&self) -> Vec<String> {
+    /// Take any pending `OSC 9` / `OSC 777` notifications. The GPUI thread
+    /// drains these in the PTY event loop to surface native desktop
+    /// notifications for background panes whose command finished or needs
+    /// input while the user was elsewhere.
+    pub fn take_pending_notifications(&self) -> Vec<super::TerminalNotification> {
         std::mem::take(&mut *self.pending_notifications.lock())
     }
 
@@ -48,6 +48,15 @@ impl Terminal {
     /// Clear the bell notification flag (call when terminal receives focus)
     pub fn clear_bell(&self) {
         *self.has_bell.lock() = false;
+    }
+
+    /// Consume the one-shot "bell rang since last drain" edge. Returns true if
+    /// the terminal rang the bell since the previous call, then resets it. The
+    /// PTY event loop uses this to raise a desktop notification exactly once
+    /// per bell (distinct from `has_bell`, the sticky UI flag).
+    pub fn take_pending_bell(&self) -> bool {
+        self.bell_pending
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the initial working directory for this terminal
