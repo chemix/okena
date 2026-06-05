@@ -5,7 +5,7 @@
 //! is split across the `git_header/` submodules — one per concern.
 
 use okena_git::{BranchList, CommitLogEntry, FileDiffSummary};
-use okena_ui::simple_input::SimpleInputState;
+use okena_ui::simple_input::{InputChangedEvent, SimpleInputState};
 use okena_workspace::request_broker::RequestBroker;
 use okena_workspace::state::Workspace;
 
@@ -50,6 +50,17 @@ enum BranchPickerStatus {
 enum BranchKind {
     Local,
     Remote,
+}
+
+/// A single navigable entry in the branch switcher list, flattened across the
+/// LOCAL and REMOTE sections (local-first) so a single `selected_index` can
+/// drive keyboard navigation. Recomputed whenever the filter text or the loaded
+/// branch list changes — see `recompute_branch_filtered`.
+#[derive(Clone)]
+struct BranchNavItem {
+    name: String,
+    kind: BranchKind,
+    is_current: bool,
 }
 
 /// State for the right-click context menu on a commit row in the graph.
@@ -105,6 +116,14 @@ pub struct GitHeader {
     branch_picker_bounds: Bounds<Pixels>,
     branch_picker_list: BranchList,
     branch_picker_filter: Entity<SimpleInputState>,
+    /// Filtered branches in display order (local-first), derived from
+    /// `branch_picker_list` + the filter text. Drives keyboard selection.
+    branch_picker_filtered: Vec<BranchNavItem>,
+    /// Index into `branch_picker_filtered` of the keyboard-highlighted row.
+    branch_picker_selected: usize,
+    /// Scroll handle for the branch list, so keyboard navigation can keep the
+    /// selected row in view.
+    branch_picker_scroll: ScrollHandle,
     branch_picker_create_mode: bool,
     branch_picker_create_name: Entity<SimpleInputState>,
     branch_picker_status: BranchPickerStatus,
@@ -135,6 +154,17 @@ impl GitHeader {
         let branch_picker_create_name = cx.new(|cx| {
             SimpleInputState::new(cx).placeholder("New branch name")
         });
+        // Re-filter the branch list (and reset the keyboard selection) as the
+        // user types. Without this the parent `GitHeader` wouldn't re-run its
+        // own filtering when only the child input entity notifies.
+        cx.subscribe(
+            &branch_picker_filter,
+            |this: &mut Self, _, _: &InputChangedEvent, cx| {
+                this.recompute_branch_filtered(cx);
+                cx.notify();
+            },
+        )
+        .detach();
         Self {
             project_id,
             request_broker,
@@ -166,6 +196,9 @@ impl GitHeader {
             branch_picker_bounds: Bounds::default(),
             branch_picker_list: BranchList::default(),
             branch_picker_filter,
+            branch_picker_filtered: Vec::new(),
+            branch_picker_selected: 0,
+            branch_picker_scroll: ScrollHandle::new(),
             branch_picker_create_mode: false,
             branch_picker_create_name,
             branch_picker_status: BranchPickerStatus::Idle,
