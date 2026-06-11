@@ -278,7 +278,7 @@ pub(super) fn build_image_content(
             }
             let initial_scale: f32 = 1.0;
             let rendered = svg_renderer
-                .render_single_frame(&bytes, initial_scale, true)
+                .render_single_frame(&bytes, initial_scale)
                 .map_err(|e| format!("Cannot decode SVG: {}", e))?;
             // SVG is XML — UTF-8 unless someone hand-saved it weird. If
             // decoding fails we still surface the preview without source.

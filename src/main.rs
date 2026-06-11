@@ -37,6 +37,21 @@ use std::sync::Arc;
 
 use std::net::IpAddr;
 
+// Global allocator: mimalloc by default (handles okena's high-churn,
+// multi-threaded small-allocation workload without the RSS blowup glibc malloc
+// exhibits). When the dhat heap profiler is enabled we hand the global
+// allocator over to dhat instead so it can record every allocation.
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Heap profiler (opt-in via `--features dhat-heap`). When enabled, dhat's
+// allocator wraps the system allocator to record every allocation; the
+// `Profiler` guard created at the top of `main` writes `dhat-heap.json` on exit.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 /// Writes to both stderr and a log file simultaneously.
 struct TeeWriter {
     stderr: std::io::Stderr,
@@ -298,6 +313,11 @@ fn main() {
         println!("okena {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+
+    // Start heap profiling for the lifetime of the process. Held until `main`
+    // returns, at which point dhat writes `dhat-heap.json` into the cwd.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
 
     let args: Vec<String> = std::env::args().collect();
 

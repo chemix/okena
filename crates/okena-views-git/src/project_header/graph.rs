@@ -242,7 +242,7 @@ pub(super) fn render_lane_row(
                         .text_color(rgb(t.text_primary))
                         .text_ellipsis()
                         .overflow_hidden()
-                        .flex_shrink()
+                        .flex_shrink(1.0)
                         .min_w_0()
                         .child(entry.message.clone()),
                 )

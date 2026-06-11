@@ -184,6 +184,7 @@ fn paste_filename(image: &Image) -> String {
         ImageFormat::Bmp => "bmp",
         ImageFormat::Tiff => "tiff",
         ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
     };
     format!("okena-paste-{:016x}.{}", image.id, ext)
 }

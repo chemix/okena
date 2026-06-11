@@ -68,6 +68,17 @@ notify-rust = "4"
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
 dirs = "5.0"
+
+# Global allocator. glibc malloc fragments badly under okena's high-churn,
+# multi-threaded small-allocation workload (git-status polling + per-frame
+# render/layout), so RSS climbs into the GBs without a true leak. mimalloc
+# fragments far less and returns memory to the OS. Bypassed when the dhat
+# heap profiler is active (see src/main.rs).
+mimalloc = "0.1"
+
+# Heap profiler (opt-in via `--features dhat-heap`). Off by default so it never
+# touches normal builds — see [features] and src/main.rs.
+dhat = { version = "0.3", optional = true }
 log = "0.4"
 env_logger = "0.11"
 # Standalone RUST_LOG-syntax filter (the same crate env_logger 0.11 uses) for
@@ -115,6 +126,22 @@ hmac = "0.12"
 sha2 = "0.10"
 subtle = "2.5"
 data-encoding = "2.6"
+
+[features]
+# Enable the dhat in-process heap profiler. Build with:
+#   cargo run --profile profiling --features dhat-heap
+# On exit it writes dhat-heap.json (view at
+# https://nnethercote.github.io/dh_view/dh_view.html).
+dhat-heap = ["dep:dhat"]
+
+# Profiling build: optimized like release, but keeps debug symbols so heaptrack
+# / perf show readable stacks. Leaves the real `release` profile untouched.
+#   cargo build --profile profiling
+#   heaptrack ./target/profiling/okena
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", features = ["test-support"] }

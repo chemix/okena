@@ -987,7 +987,7 @@ impl FileViewer {
                 .background_executor()
                 .spawn(async move {
                     svg_renderer
-                        .render_single_frame(&bytes, target_scale, true)
+                        .render_single_frame(&bytes, target_scale)
                         .map_err(|e| format!("Cannot re-rasterize SVG: {}", e))
                 })
                 .await;
