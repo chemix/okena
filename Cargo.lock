@@ -6226,6 +6226,7 @@ dependencies = [
  "okena-core",
  "okena-ui",
  "pulldown-cmark",
+ "serde_yaml_ng",
 ]
 
 [[package]]

@@ -7,7 +7,9 @@ use gpui::*;
 use gpui::prelude::FluentBuilder;
 use gpui_component::{h_flex, v_flex};
 
-use super::types::{char_len, slice_by_chars, Inline, Node};
+use super::types::{
+    char_len, slice_by_chars, FmValue, Frontmatter, Inline, Node,
+};
 use super::{MarkdownDocument, RenderedNode};
 
 impl MarkdownDocument {
@@ -250,6 +252,7 @@ impl MarkdownDocument {
                 header_len + rows_len
             }
             Node::HorizontalRule => 1, // newline
+            Node::Frontmatter { text_len, .. } => *text_len,
         }
     }
 
@@ -420,7 +423,117 @@ impl MarkdownDocument {
                     .bg(rgb(t.border))
                     .my(px(8.0))
             }
+            // Frontmatter renders as a self-contained metadata card. Partial
+            // (inline) selection highlighting is intentionally omitted; block
+            // selection and copy still work through the flat-text offsets.
+            Node::Frontmatter { block, .. } => Self::render_frontmatter(block, t, cx),
         }
+    }
+
+    /// Render a frontmatter block as a bordered metadata card.
+    fn render_frontmatter(fm: &Frontmatter, t: &ThemeColors, cx: &App) -> Div {
+        let card = v_flex()
+            .gap(px(4.0))
+            .w_full()
+            .p(px(12.0))
+            .mb(px(8.0))
+            .rounded(px(6.0))
+            .bg(rgb(t.bg_secondary))
+            .border_1()
+            .border_color(rgb(t.border))
+            .text_size(ui_text_md(cx));
+
+        match fm {
+            Frontmatter::Raw(raw) => card.font_family("monospace").children(
+                raw.lines().map(|line| {
+                    div()
+                        .text_color(rgb(t.text_secondary))
+                        .child(if line.is_empty() { " ".to_string() } else { line.to_string() })
+                }),
+            ),
+            Frontmatter::Parsed(entries) => {
+                card.children(entries.iter().map(|(key, value)| {
+                    Self::render_fm_entry(key, value, t, cx)
+                }))
+            }
+        }
+    }
+
+    /// Render a single `key: value` frontmatter entry. Scalars sit inline next
+    /// to the key; lists and nested maps stack below it, indented.
+    fn render_fm_entry(key: &str, value: &FmValue, t: &ThemeColors, cx: &App) -> Div {
+        let key_label = || {
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(t.text_muted))
+                .child(key.to_string())
+        };
+
+        match value {
+            FmValue::Scalar(s) => h_flex()
+                .gap(px(8.0))
+                .items_baseline()
+                .child(key_label().min_w(px(120.0)).flex_shrink_0())
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(rgb(t.text_primary))
+                        .child(s.clone()),
+                ),
+            FmValue::Empty => h_flex()
+                .gap(px(8.0))
+                .items_baseline()
+                .child(key_label().min_w(px(120.0)).flex_shrink_0())
+                .child(
+                    div()
+                        .italic()
+                        .text_color(rgb(t.text_muted))
+                        .child("\u{2014}"),
+                ),
+            FmValue::List(items) => v_flex()
+                .gap(px(2.0))
+                .child(key_label())
+                .child(Self::render_fm_list(items, t, cx)),
+            FmValue::Map(sub) => v_flex()
+                .gap(px(2.0))
+                .child(key_label())
+                .child(
+                    v_flex()
+                        .gap(px(4.0))
+                        .pl(px(16.0))
+                        .children(sub.iter().map(|(k, v)| Self::render_fm_entry(k, v, t, cx))),
+                ),
+        }
+    }
+
+    /// Render a frontmatter sequence as a bulleted, indented list.
+    fn render_fm_list(items: &[FmValue], t: &ThemeColors, cx: &App) -> Div {
+        let mut list = v_flex().gap(px(2.0)).pl(px(16.0));
+        for item in items {
+            list = list.child(match item {
+                FmValue::Scalar(s) => h_flex()
+                    .gap(px(8.0))
+                    .items_baseline()
+                    .child(div().text_color(rgb(t.text_muted)).child("\u{2022}"))
+                    .child(div().text_color(rgb(t.text_primary)).child(s.clone())),
+                FmValue::Empty => h_flex()
+                    .gap(px(8.0))
+                    .child(div().text_color(rgb(t.text_muted)).child("\u{2022}")),
+                FmValue::List(inner) => v_flex()
+                    .child(div().text_color(rgb(t.text_muted)).child("\u{2022}"))
+                    .child(Self::render_fm_list(inner, t, cx)),
+                FmValue::Map(sub) => v_flex()
+                    .gap(px(4.0))
+                    .child(div().text_color(rgb(t.text_muted)).child("\u{2022}"))
+                    .child(
+                        v_flex()
+                            .gap(px(4.0))
+                            .pl(px(16.0))
+                            .children(sub.iter().map(|(k, v)| Self::render_fm_entry(k, v, t, cx))),
+                    ),
+            });
+        }
+        list
     }
 
     /// Render inline elements with selection highlighting.

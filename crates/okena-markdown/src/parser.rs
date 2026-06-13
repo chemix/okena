@@ -2,17 +2,31 @@
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use super::types::{Inline, Node};
+use super::types::{FmValue, Frontmatter, Inline, Node};
 use super::MarkdownDocument;
 
 impl MarkdownDocument {
     /// Parse markdown content into a document.
     pub fn parse(content: &str) -> Self {
+        let mut nodes = Vec::new();
+
+        // Peel off a leading YAML frontmatter block before handing the rest to
+        // pulldown-cmark, which would otherwise turn `key: value` lines plus the
+        // closing `---` into a setext heading (everything mashed onto one line).
+        let markdown = match split_frontmatter(content) {
+            Some((inner, rest)) => {
+                if let Some(node) = parse_frontmatter(inner) {
+                    nodes.push(node);
+                }
+                rest
+            }
+            None => content,
+        };
+
         let mut options = Options::empty();
         options.insert(Options::ENABLE_TABLES);
-        let parser = Parser::new_ext(content, options);
+        let parser = Parser::new_ext(markdown, options);
 
-        let mut nodes = Vec::new();
         let mut inline_stack: Vec<Vec<Inline>> = vec![Vec::new()];
 
         // State
@@ -55,29 +69,27 @@ impl MarkdownDocument {
                     in_paragraph = true;
                     inline_stack.push(Vec::new());
                 }
-                Event::End(TagEnd::Paragraph) => {
-                    if in_paragraph {
-                        let children = inline_stack.pop().unwrap_or_default();
-                        if in_blockquote {
-                            // Add to blockquote
-                            if let Some(last) = inline_stack.last_mut() {
-                                last.extend(children);
-                            }
-                        } else if in_list {
-                            // Will be collected by Item end
-                            if let Some(last) = inline_stack.last_mut() {
-                                last.extend(children);
-                            }
-                        } else if in_table {
-                            // Table cell content
-                            if let Some(last) = inline_stack.last_mut() {
-                                last.extend(children);
-                            }
-                        } else {
-                            nodes.push(Node::Paragraph { children });
+                Event::End(TagEnd::Paragraph) if in_paragraph => {
+                    let children = inline_stack.pop().unwrap_or_default();
+                    if in_blockquote {
+                        // Add to blockquote
+                        if let Some(last) = inline_stack.last_mut() {
+                            last.extend(children);
                         }
-                        in_paragraph = false;
+                    } else if in_list {
+                        // Will be collected by Item end
+                        if let Some(last) = inline_stack.last_mut() {
+                            last.extend(children);
+                        }
+                    } else if in_table {
+                        // Table cell content
+                        if let Some(last) = inline_stack.last_mut() {
+                            last.extend(children);
+                        }
+                    } else {
+                        nodes.push(Node::Paragraph { children });
                     }
+                    in_paragraph = false;
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
                     in_code_block = true;
@@ -150,10 +162,8 @@ impl MarkdownDocument {
                 Event::Start(Tag::TableRow) => {
                     current_row.clear();
                 }
-                Event::End(TagEnd::TableRow) => {
-                    if !in_table_head {
-                        table_rows.push(std::mem::take(&mut current_row));
-                    }
+                Event::End(TagEnd::TableRow) if !in_table_head => {
+                    table_rows.push(std::mem::take(&mut current_row));
                 }
                 Event::Start(Tag::TableCell) => {
                     inline_stack.push(Vec::new());
@@ -296,6 +306,9 @@ impl MarkdownDocument {
             Node::HorizontalRule => {
                 text.push('\n');
             }
+            Node::Frontmatter { block, .. } => {
+                text.push_str(&super::types::frontmatter_flat_text(block));
+            }
         }
     }
 
@@ -333,6 +346,63 @@ impl MarkdownDocument {
             }
         }
     }
+}
+
+/// Detect a leading YAML frontmatter block delimited by `---` fences.
+///
+/// The opening `---` must be the very first line of the document. The block is
+/// closed by a line that is exactly `---` or `...`. Returns `(inner, rest)`
+/// where `inner` is the YAML between the fences and `rest` is the markdown that
+/// follows the closing fence. Returns `None` when no well-formed block is found.
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let first = content.split_inclusive('\n').next()?;
+    if first.trim_end_matches(['\r', '\n']) != "---" {
+        return None;
+    }
+    // A bare `---` with no following line is a horizontal rule, not frontmatter.
+    let body = &content[first.len()..];
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut offset = first.len();
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "---" || trimmed == "..." {
+            let inner = &content[first.len()..offset];
+            let rest = &content[offset + line.len()..];
+            return Some((inner, rest));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Parse the inner YAML of a frontmatter block into a [`Node::Frontmatter`].
+///
+/// A well-formed mapping becomes an ordered key/value card; anything else
+/// (invalid YAML, or a bare scalar/sequence) is preserved verbatim. An empty
+/// block (`---\n---`, `{}`, or only-null) carries no metadata to show, so it
+/// yields `None` and no node is emitted — no empty card.
+fn parse_frontmatter(inner: &str) -> Option<Node> {
+    let block = match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(inner) {
+        Ok(serde_yaml_ng::Value::Mapping(map)) => {
+            let entries: Vec<(String, FmValue)> = map
+                .into_iter()
+                .map(|(k, v)| {
+                    (super::types::yaml_key_to_string(&k), FmValue::from_yaml(v))
+                })
+                .collect();
+            if entries.is_empty() {
+                return None;
+            }
+            Frontmatter::Parsed(entries)
+        }
+        Ok(serde_yaml_ng::Value::Null) => return None,
+        _ => Frontmatter::Raw(inner.trim_matches('\n').to_string()),
+    };
+    let text_len = super::types::char_len(&super::types::frontmatter_flat_text(&block));
+    Some(Node::Frontmatter { block, text_len })
 }
 
 #[cfg(test)]
@@ -374,5 +444,148 @@ let x = 1;
         assert_eq!(doc.node_offsets.len(), doc.nodes.len());
         // First node always starts at 0.
         assert_eq!(doc.node_offsets.first().copied(), Some(0));
+    }
+
+    use super::super::types::{FmValue, Frontmatter, Node};
+    use super::split_frontmatter;
+
+    #[test]
+    fn detects_frontmatter_and_keeps_markdown() {
+        let content = "\
+---
+title: Hello World
+draft: true
+---
+
+# Body
+";
+        let doc = MarkdownDocument::parse(content);
+
+        // First node is the frontmatter card, parsed in order.
+        let Node::Frontmatter { block: Frontmatter::Parsed(entries), .. } = &doc.nodes[0] else {
+            panic!("expected parsed frontmatter, got something else");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "title");
+        assert!(matches!(&entries[0].1, FmValue::Scalar(s) if s == "Hello World"));
+        assert_eq!(entries[1].0, "draft");
+        assert!(matches!(&entries[1].1, FmValue::Scalar(s) if s == "true"));
+
+        // The heading after the closing fence still parses as a heading.
+        assert!(doc.nodes[1..]
+            .iter()
+            .any(|n| matches!(n, Node::Heading { .. })));
+        // Offsets stay consistent with node lengths once frontmatter is included.
+        let mut offset = 0usize;
+        for (i, node) in doc.nodes.iter().enumerate() {
+            assert_eq!(doc.node_offsets[i], offset);
+            offset += MarkdownDocument::node_text_length(node);
+        }
+    }
+
+    #[test]
+    fn parses_lists_and_nested_maps() {
+        let content = "\
+---
+tags:
+  - rust
+  - gpui
+author:
+  name: David
+  role: dev
+---
+body
+";
+        let doc = MarkdownDocument::parse(content);
+        let Node::Frontmatter { block: Frontmatter::Parsed(entries), .. } = &doc.nodes[0] else {
+            panic!("expected parsed frontmatter");
+        };
+        assert!(matches!(&entries[0].1, FmValue::List(items) if items.len() == 2));
+        assert!(matches!(&entries[1].1, FmValue::Map(sub) if sub.len() == 2));
+    }
+
+    #[test]
+    fn invalid_yaml_falls_back_to_raw() {
+        // A bare scalar between fences is valid YAML but not a mapping.
+        let content = "---\njust some text\n---\n# Body\n";
+        let doc = MarkdownDocument::parse(content);
+        assert!(matches!(
+            &doc.nodes[0],
+            Node::Frontmatter { block: Frontmatter::Raw(_), .. }
+        ));
+    }
+
+    #[test]
+    fn bare_horizontal_rule_is_not_frontmatter() {
+        // No closing fence -> not frontmatter; `---` stays a horizontal rule.
+        assert_eq!(split_frontmatter("---\njust a hr\n\nmore text\n"), None);
+        assert_eq!(split_frontmatter("---"), None);
+        assert_eq!(split_frontmatter("# Heading\n---\n"), None);
+    }
+
+    #[test]
+    fn closing_fence_with_dots() {
+        let content = "---\nkey: value\n...\nbody\n";
+        let doc = MarkdownDocument::parse(content);
+        assert!(matches!(
+            &doc.nodes[0],
+            Node::Frontmatter { block: Frontmatter::Parsed(_), .. }
+        ));
+    }
+
+    #[test]
+    fn empty_frontmatter_emits_no_node() {
+        // An empty block carries no metadata: no frontmatter node is emitted and
+        // the following markdown still parses as usual (no empty card).
+        for content in [
+            "---\n---\n# Body\n",
+            "---\n\n---\n# Body\n",
+            "---\n{}\n---\n# Body\n",
+        ] {
+            let doc = MarkdownDocument::parse(content);
+            assert!(
+                !doc.nodes
+                    .iter()
+                    .any(|n| matches!(n, Node::Frontmatter { .. })),
+                "expected no frontmatter node for {content:?}"
+            );
+            assert!(
+                matches!(doc.nodes.first(), Some(Node::Heading { .. })),
+                "expected heading first for {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_frontmatter_len_matches_flat_text() {
+        // The precomputed `text_len` must equal the actual flat-text length, or
+        // node offsets drift out of sync with `plain_text` and copy breaks.
+        let content = "\
+---
+title: Hello
+tags:
+  - a
+  - b
+author:
+  name: David
+---
+# Body
+";
+        let doc = MarkdownDocument::parse(content);
+        let Node::Frontmatter { block, text_len } = &doc.nodes[0] else {
+            panic!("expected frontmatter");
+        };
+        assert_eq!(
+            *text_len,
+            super::super::types::char_len(&super::super::types::frontmatter_flat_text(block))
+        );
+
+        // Sum of node lengths must equal the flat-text length copy slices from.
+        let total: usize = doc
+            .nodes
+            .iter()
+            .map(MarkdownDocument::node_text_length)
+            .sum();
+        assert_eq!(total, doc.plain_text.chars().count());
     }
 }
