@@ -63,7 +63,7 @@ pub fn load_project_config(project_path: &str) -> crate::ServiceResult<Option<Ok
             source: e,
         })?;
     let config: OkenaProjectConfig =
-        serde_yaml::from_str(&content).map_err(|e| ServiceError::ParseError {
+        serde_yaml_ng::from_str(&content).map_err(|e| ServiceError::ParseError {
             context: path.display().to_string(),
             detail: e.to_string(),
         })?;
@@ -81,7 +81,7 @@ services:
   - name: "Vite Dev"
     command: "npm run dev"
 "#;
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.services.len(), 1);
         assert_eq!(config.services[0].name, "Vite Dev");
         assert_eq!(config.services[0].command, "npm run dev");
@@ -107,7 +107,7 @@ services:
     restart_on_crash: true
     restart_delay_ms: 2000
 "#;
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.services.len(), 1);
         let svc = &config.services[0];
         assert_eq!(svc.name, "Vite Dev");
@@ -123,7 +123,7 @@ services:
     #[test]
     fn parse_empty_services() {
         let yaml = "services: []\n";
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.services.is_empty());
     }
 
@@ -140,7 +140,7 @@ docker_compose:
     - web
     - db
 "#;
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.services.len(), 1);
         let dc = config.docker_compose.unwrap();
         assert_eq!(dc.file.unwrap(), "docker-compose.prod.yml");
@@ -155,7 +155,7 @@ services:
   - name: "test"
     command: "echo hi"
 "#;
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.docker_compose.is_none());
     }
 
@@ -165,7 +165,7 @@ services:
 services: []
 docker_compose: {}
 "#;
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let dc = config.docker_compose.unwrap();
         assert!(dc.file.is_none());
         assert!(dc.enabled.is_none());
@@ -179,7 +179,7 @@ services:
   - name: "test"
     command: "echo hi"
 "#;
-        let config: OkenaProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: OkenaProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let svc = &config.services[0];
         assert_eq!(svc.cwd, ".");
         assert!(!svc.auto_start);
