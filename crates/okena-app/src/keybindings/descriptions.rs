@@ -7,7 +7,7 @@ use super::{
     FocusSidebar, FocusUp, FullscreenNextTerminal, FullscreenPrevTerminal, InstallUpdate,
     JumpToNextPrompt, JumpToPreviousPrompt,
     MinimizeTerminal, NewProject, NewWindow, OpenSettingsFile, Paste, Quit, ResetZoom, ScrollDown, ScrollUp,
-    Search, SearchNext, SearchPrev, SendEscape, ShowCommandPalette, ShowDiffViewer,
+    Search, SearchNext, SearchPrev, SendEscape, ShowCommandPalette, ShowDiffViewer, ReviewChanges,
     ShowContentSearch, ShowFileSearch, ShowHookLog, ShowLogConsole, ShowKeybindings, ShowProjectSwitcher, ShowSessionManager,
     ShowSettings, ShowThemeSelector, SplitHorizontal, SplitVertical, StartAllServices,
     StopAllServices, ToggleFullscreen, TogglePaneSwitcher, ToggleSidebar, ToggleSidebarAutoHide,
@@ -450,6 +450,15 @@ pub fn get_action_descriptions() -> HashMap<&'static str, ActionDescription> {
             description: "View git diff for the current project",
             category: "Git",
             factory: || Box::new(ShowDiffViewer),
+        },
+    );
+    map.insert(
+        "ReviewChanges",
+        ActionDescription {
+            name: "Review Changes vs Base",
+            description: "Diff the current branch against its base (e.g. origin/main)",
+            category: "Git",
+            factory: || Box::new(ReviewChanges),
         },
     );
     // Sidebar navigation

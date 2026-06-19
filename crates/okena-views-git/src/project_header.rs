@@ -93,23 +93,27 @@ pub fn ahead_behind_tooltip(
     ahead: Option<usize>,
     behind: Option<usize>,
     unpushed: Option<usize>,
+    base: Option<&str>,
 ) -> Option<String> {
     let a = ahead.unwrap_or(0);
     let b = behind.unwrap_or(0);
     let u = unpushed.unwrap_or(0);
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let base_label = base.unwrap_or("base");
 
-    // When unpushed differs from ahead, the branch's upstream isn't its own
-    // remote (typical worktree case). Surface both numbers so the user can
-    // tell "ahead of main" from "not on origin/<branch>".
+    // When unpushed differs from ahead, the branch's own remote isn't the base
+    // (typical worktree case). Surface both numbers so the user can tell
+    // "ahead of base" from "not pushed to origin/<branch>".
     let show_unpushed = unpushed.is_some() && Some(a) != unpushed;
 
     let mut parts: Vec<String> = Vec::new();
     if a > 0 {
-        parts.push(format!("{a} commit{} ahead of upstream", plural(a)));
+        // The ahead count is the clickable "review" affordance when we have a base.
+        let hint = if base.is_some() { " — click to review" } else { "" };
+        parts.push(format!("{a} commit{} ahead of {base_label}{hint}", plural(a)));
     }
     if b > 0 {
-        parts.push(format!("{b} commit{} behind upstream", plural(b)));
+        parts.push(format!("{b} commit{} behind {base_label}", plural(b)));
     }
     if show_unpushed {
         parts.push(format!(
@@ -141,21 +145,23 @@ fn render_sign_count(sign: &str, count: usize, color: u32, alpha: f32) -> Div {
 
 /// Render an ahead/behind/unpushed indicator.
 ///
-/// - `↑N` (green) — commits ahead of the upstream tracking branch
-/// - `↓M` (yellow) — commits behind the upstream tracking branch
+/// - `↑N` (green) — commits ahead of the review base (`origin/<default>`)
+/// - `↓M` (yellow) — commits behind the review base (branch is stale)
 /// - `↟K` (cyan, double-headed) — commits not on `origin/<branch>`. Only
-///   shown when the count differs from `ahead` (i.e. upstream isn't the
-///   branch's own remote — typical worktree case), so it doesn't double up
-///   in the common case where `↑N` already means "to push".
+///   shown when the count differs from `ahead` (i.e. the branch's own remote
+///   isn't the base — typical worktree case), so it doesn't double up in the
+///   common case where `↑N` already means "to push".
 ///
+/// `base` is the base ref name (e.g. `origin/main`) used in the tooltip.
 /// Zero-count sides are hidden. Returns `None` when nothing is worth showing.
 pub fn render_ahead_behind_badge(
     ahead: Option<usize>,
     behind: Option<usize>,
     unpushed: Option<usize>,
+    base: Option<&str>,
     t: &ThemeColors,
 ) -> Option<AnyElement> {
-    let tooltip_text = ahead_behind_tooltip(ahead, behind, unpushed)?;
+    let tooltip_text = ahead_behind_tooltip(ahead, behind, unpushed, base)?;
     let a = ahead.unwrap_or(0);
     let b = behind.unwrap_or(0);
     let u = unpushed.unwrap_or(0);

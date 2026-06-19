@@ -1,4 +1,4 @@
-use crate::keybindings::{ShowKeybindings, ShowSessionManager, ShowThemeSelector, ShowCommandPalette, ShowSettings, OpenSettingsFile, ShowFileSearch, ShowContentSearch, ShowProjectSwitcher, ShowDiffViewer, ShowHookLog, ShowLogConsole, NewProject, NewWindow, CloseWindow, ToggleSidebar, ToggleSidebarAutoHide, TogglePaneSwitcher, CreateWorktree, CheckForUpdates, InstallUpdate, FocusSidebar, FocusActiveProject, ShowPairingDialog, StartAllServices, StopAllServices, ClearFocus, EqualizeLayout, ToggleProjectLayout, ShowBranchSwitcher, ShowProfileManager};
+use crate::keybindings::{ShowKeybindings, ShowSessionManager, ShowThemeSelector, ShowCommandPalette, ShowSettings, OpenSettingsFile, ShowFileSearch, ShowContentSearch, ShowProjectSwitcher, ShowDiffViewer, ReviewChanges, ShowHookLog, ShowLogConsole, NewProject, NewWindow, CloseWindow, ToggleSidebar, ToggleSidebarAutoHide, TogglePaneSwitcher, CreateWorktree, CheckForUpdates, InstallUpdate, FocusSidebar, FocusActiveProject, ShowPairingDialog, StartAllServices, StopAllServices, ClearFocus, EqualizeLayout, ToggleProjectLayout, ShowBranchSwitcher, ShowProfileManager};
 use crate::settings::{open_settings_file, settings_entity};
 use crate::theme::theme;
 use crate::views::layout::navigation::{get_pane_map, prune_pane_map};
@@ -1000,6 +1000,51 @@ impl Render for WindowView {
                         }), cx);
                     });
                 }
+            }))
+            // Review the focused project's branch against its base (three-dot
+            // BranchCompare). Falls back to the working-tree diff when there's
+            // no resolvable base (on the default branch) or for remote projects.
+            .on_action(cx.listener(|this, _: &ReviewChanges, _window, cx| {
+                let target = {
+                    let fm = this.focus_manager.read(cx);
+                    let ws = this.workspace.read(cx);
+                    let project_id = fm.focused_terminal_state()
+                        .map(|f| f.project_id.clone())
+                        .or_else(|| {
+                            ws.visible_projects(this.window_id, fm.focused_project_id(), fm.is_focus_individual())
+                                .first()
+                                .map(|p| p.id.clone())
+                        });
+                    project_id.and_then(|pid| {
+                        ws.projects()
+                            .iter()
+                            .find(|p| p.id == pid)
+                            .map(move |p| (pid, p.path.clone(), p.is_remote))
+                    })
+                };
+
+                let Some((project_id, project_path, is_remote)) = target else {
+                    return;
+                };
+
+                let mode = if is_remote {
+                    None
+                } else {
+                    crate::git::resolve_review_base(std::path::Path::new(&project_path))
+                        .map(|base| crate::git::DiffMode::BranchCompare {
+                            base,
+                            head: "HEAD".to_string(),
+                        })
+                };
+
+                this.request_broker.update(cx, |broker, cx| {
+                    broker.push_overlay_request(OverlayRequest::Project(ProjectOverlay {
+                        project_id,
+                        kind: ProjectOverlayKind::DiffViewer {
+                            file: None, mode, commit_message: None, commits: None, commit_index: None,
+                        },
+                    }), cx);
+                });
             }))
             // Title bar at the top (with window controls)
             // On macOS fullscreen: hide title bar completely (traffic lights auto-hide)

@@ -6,7 +6,7 @@ use crate::project_header;
 
 use okena_core::process::open_url;
 use okena_core::theme::ThemeColors;
-use okena_git::GitStatus;
+use okena_git::{DiffMode, GitStatus};
 use okena_ui::tokens::ui_text_sm;
 use okena_workspace::requests::{OverlayRequest, ProjectOverlay, ProjectOverlayKind};
 
@@ -36,6 +36,10 @@ impl GitHeader {
                 let lines_added = status.lines_added;
                 let lines_removed = status.lines_removed;
                 let project_id = self.project_id.clone();
+                // Base ref for a "review changes" diff (three-dot base...HEAD).
+                // `None` when HEAD is on the default branch (nothing to review).
+                let review_base = status.review_base.clone();
+                let review_head = status.branch.clone();
 
                 h_flex()
                     .flex_shrink_0()
@@ -205,14 +209,66 @@ impl GitHeader {
                                 ).absolute().size_full())
                         )
                     })
+                    // Ahead/behind vs the review base. When a base exists this
+                    // doubles as the "review changes" affordance: a leading
+                    // pull-request glyph + clicking opens a three-dot diff of
+                    // the branch against its base (e.g. origin/main).
                     .when_some(
                         project_header::render_ahead_behind_badge(
                             status.ahead,
                             status.behind,
                             status.unpushed,
+                            review_base.as_deref(),
                             t,
                         ),
-                        |d, badge| d.child(badge),
+                        |d, badge| {
+                            let Some(base) = review_base.clone() else {
+                                // No base (HEAD on the default branch): show the
+                                // badge (e.g. unpushed) without the review action.
+                                return d.child(badge);
+                            };
+                            let request_broker = self.request_broker.clone();
+                            let project_id_for_review = self.project_id.clone();
+                            let head = review_head.clone().unwrap_or_else(|| "HEAD".to_string());
+                            d.child(
+                                h_flex()
+                                    .id(ElementId::Name(format!("git-review-{}", project_id).into()))
+                                    .cursor_pointer()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .px(px(3.0))
+                                    .h(px(16.0))
+                                    .rounded(px(3.0))
+                                    .hover(|s| s.bg(rgb(t.bg_hover)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |_this, _, _window, cx| {
+                                        cx.stop_propagation();
+                                        let base = base.clone();
+                                        let head = head.clone();
+                                        request_broker.update(cx, |broker, cx| {
+                                            broker.push_overlay_request(OverlayRequest::Project(ProjectOverlay {
+                                                project_id: project_id_for_review.clone(),
+                                                kind: ProjectOverlayKind::DiffViewer {
+                                                    file: None,
+                                                    mode: Some(DiffMode::BranchCompare { base, head }),
+                                                    commit_message: None,
+                                                    commits: None,
+                                                    commit_index: None,
+                                                },
+                                            }), cx);
+                                        });
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path("icons/git-pull-request.svg")
+                                            .size(px(10.0))
+                                            .text_color(rgb(t.text_muted)),
+                                    )
+                                    .child(badge),
+                            )
+                        },
                     )
                     .into_any_element()
             }
