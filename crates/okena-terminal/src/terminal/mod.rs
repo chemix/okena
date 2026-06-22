@@ -39,13 +39,13 @@ pub use resize_authority::{
 };
 pub use transport::TerminalTransport;
 pub use types::{
-    AppCursorShape, DetectedLink, PromptMark, PromptMarkKind, ResizeState, SelectionState,
-    TerminalProgress, TerminalProgressState, TerminalSize,
+    AppCursorShape, ClipboardReadResponder, DetectedLink, PromptMark, PromptMarkKind, ResizeState,
+    SelectionState, TerminalProgress, TerminalProgressState, TerminalSize,
 };
 
 pub use osc_sidecar::TerminalNotification;
 
-use event_listener::ZedEventListener;
+use event_listener::{ClipboardQueues, ZedEventListener};
 use osc_sidecar::OscSidecar;
 use prompt_marks::{PromptSidecar, PromptTracker};
 use types::FocusReportState;
@@ -163,6 +163,15 @@ pub struct Terminal {
     /// drained by the GPUI render path via `drain_clipboard_writes`.
     /// GPUI thread only.
     pub(super) pending_clipboard: Arc<Mutex<Vec<String>>>,
+
+    /// Pending OSC 52 clipboard *read* requests (`OSC 52 ; c ; ?`) from the
+    /// running app, each carrying the formatter that turns clipboard text
+    /// into the PTY reply. `Arc` shared with `ZedEventListener`: pushed on
+    /// `ClipboardLoad` during `process_output`, drained on the GPUI thread
+    /// (in the PTY event loop, where the settings gate and the system
+    /// clipboard are reachable) via `answer_clipboard_reads` /
+    /// `drop_clipboard_reads`. GPUI thread only.
+    pub(super) pending_clipboard_reads: Arc<Mutex<Vec<ClipboardReadResponder>>>,
 
     /// Theme palette used to answer OSC 10/11/12/4 color queries from
     /// terminal apps. `Arc` shared with `ZedEventListener`: the render path
@@ -319,6 +328,14 @@ impl Terminal {
                 shape: VteCursorShape::HollowBlock,
                 blinking: false,
             },
+            // Accept OSC 52 *read* (paste) sequences in addition to writes.
+            // alacritty's default `OnlyCopy` silently drops `OSC 52 ; c ; ?`
+            // and never emits `ClipboardLoad`; `CopyPaste` makes it emit the
+            // event so Okena can queue the request and decide whether to
+            // answer it based on the opt-in `allow_clipboard_read` setting
+            // (off by default). The actual security gate lives in Okena, not
+            // here — alacritty just hands us the request.
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
             ..TermConfig::default()
         };
         let term_size = TermSize::new(size.cols as usize, size.rows as usize);
@@ -328,12 +345,16 @@ impl Terminal {
         let has_bell = Arc::new(Mutex::new(false));
         let bell_pending = Arc::new(AtomicBool::new(false));
         let pending_clipboard = Arc::new(Mutex::new(Vec::new()));
+        let pending_clipboard_reads = Arc::new(Mutex::new(Vec::new()));
         let palette = Arc::new(Mutex::new(None));
         let event_listener = ZedEventListener::new(
             title.clone(),
             has_bell.clone(),
             bell_pending.clone(),
-            pending_clipboard.clone(),
+            ClipboardQueues {
+                writes: pending_clipboard.clone(),
+                reads: pending_clipboard_reads.clone(),
+            },
             palette.clone(),
             transport.clone(),
             terminal_id.clone(),
@@ -364,6 +385,7 @@ impl Terminal {
             bell_pending,
             has_notification: AtomicBool::new(false),
             pending_clipboard,
+            pending_clipboard_reads,
             palette,
             pending_output: Mutex::new(Vec::new()),
             dirty: AtomicBool::new(false),

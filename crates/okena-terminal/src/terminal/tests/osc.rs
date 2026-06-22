@@ -633,6 +633,111 @@ fn test_bell_edge_is_one_shot() {
 }
 
 #[test]
+fn test_osc52_read_request_queues_responder() {
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".into(),
+    );
+
+    assert!(!terminal.has_pending_clipboard_reads(), "nothing queued yet");
+
+    // OSC 52 ; c ; ? — the app asks to READ the clipboard.
+    terminal.process_output(b"\x1b]52;c;?\x07");
+
+    assert!(
+        terminal.has_pending_clipboard_reads(),
+        "a read request must be queued",
+    );
+    // Queuing the request must not write anything to the PTY on its own —
+    // the reply is only sent once answered with clipboard contents.
+    assert!(
+        transport.writes().is_empty(),
+        "no PTY reply until answered: {:?}",
+        transport.writes(),
+    );
+}
+
+#[test]
+fn test_osc52_answer_clipboard_reads_replies_and_drains() {
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".into(),
+    );
+
+    terminal.process_output(b"\x1b]52;c;?\x07");
+    assert!(terminal.has_pending_clipboard_reads());
+
+    terminal.answer_clipboard_reads("hi");
+
+    // The queue is drained once answered.
+    assert!(
+        !terminal.has_pending_clipboard_reads(),
+        "queue must be empty after answering",
+    );
+    // A non-empty OSC 52 response was written back to the PTY.
+    let writes = transport.writes();
+    assert_eq!(writes.len(), 1, "expected exactly one PTY reply");
+    assert!(!writes[0].is_empty(), "reply must not be empty");
+    let body = std::str::from_utf8(&writes[0]).unwrap();
+    assert!(body.contains("52;"), "reply should be an OSC 52 sequence: {body:?}");
+}
+
+#[test]
+fn test_osc52_drop_clipboard_reads_clears_without_reply() {
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".into(),
+    );
+
+    terminal.process_output(b"\x1b]52;c;?\x07");
+    assert!(terminal.has_pending_clipboard_reads());
+
+    // Silent deny: drop the request without writing anything to the PTY.
+    terminal.drop_clipboard_reads();
+
+    assert!(!terminal.has_pending_clipboard_reads(), "queue must be cleared");
+    assert!(
+        transport.writes().is_empty(),
+        "dropping must not reply: {:?}",
+        transport.writes(),
+    );
+}
+
+#[test]
+fn test_osc52_write_does_not_enqueue_read() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // A plain OSC 52 *write* (base64 "hi" == "aGk=") stores clipboard text and
+    // must NOT enqueue a read request.
+    terminal.process_output(b"\x1b]52;c;aGk=\x07");
+
+    assert!(
+        !terminal.has_pending_clipboard_reads(),
+        "a write must not enqueue a read",
+    );
+    assert_eq!(
+        terminal.take_pending_clipboard_writes(),
+        vec!["hi".to_string()],
+        "the write text must reach the clipboard-write queue",
+    );
+}
+
+#[test]
 fn test_xtversion_responds_with_okena_name() {
     set_app_version("0.20.0-test");
 

@@ -130,6 +130,12 @@ impl SettingsState {
         self.save_and_notify(cx);
     }
 
+    /// Allow or deny terminal apps reading the system clipboard via OSC 52.
+    pub fn set_allow_clipboard_read(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.settings.allow_clipboard_read = value;
+        self.save_and_notify(cx);
+    }
+
     /// Set file finder "show ignored" preference (persisted default for future opens).
     pub fn set_file_finder_show_ignored(&mut self, value: bool, cx: &mut Context<Self>) {
         self.settings.file_finder.show_ignored = value;

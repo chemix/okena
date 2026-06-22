@@ -4,6 +4,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::transport::TerminalTransport;
+use super::types::ClipboardReadResponder;
+
+/// The two OSC 52 clipboard queues the listener shares with `Terminal`.
+///
+/// Both are `Arc`-shared with the owning `Terminal` (which holds the same
+/// `Arc`s as separate fields) and pushed here during `process_output`, then
+/// drained on the GPUI thread. They are grouped into one struct so the
+/// listener constructor stays compact as more shared state is added.
+pub(super) struct ClipboardQueues {
+    /// Pending OSC 52 clipboard writes to be picked up by the GPUI thread.
+    pub writes: Arc<Mutex<Vec<String>>>,
+    /// Pending OSC 52 clipboard *read* requests (`OSC 52 ; c ; ?`), each
+    /// carrying a formatter that turns clipboard text into the PTY reply.
+    /// Drained on the GPUI thread, where the system clipboard and the opt-in
+    /// setting gating reads are reachable.
+    pub reads: Arc<Mutex<Vec<ClipboardReadResponder>>>,
+}
 
 /// Event listener for alacritty_terminal that captures title changes, bell, and PTY write requests
 pub struct ZedEventListener {
@@ -15,8 +32,8 @@ pub struct ZedEventListener {
     /// event loop to fire a desktop notification exactly once per bell rather
     /// than on every batch while `has_bell` stays set.
     bell_pending: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard writes to be picked up by the GPUI thread
-    pending_clipboard: Arc<Mutex<Vec<String>>>,
+    /// Pending OSC 52 clipboard write/read queues, shared with `Terminal`.
+    clipboard: ClipboardQueues,
     /// Current theme palette, pushed from the GPUI thread on each render.
     /// Used to answer OSC 10/11/12/4 color queries from apps.
     palette: Arc<Mutex<Option<okena_core::theme::ThemeColors>>>,
@@ -27,16 +44,24 @@ pub struct ZedEventListener {
 }
 
 impl ZedEventListener {
-    pub fn new(
+    pub(super) fn new(
         title: Arc<Mutex<Option<String>>>,
         has_bell: Arc<Mutex<bool>>,
         bell_pending: Arc<AtomicBool>,
-        pending_clipboard: Arc<Mutex<Vec<String>>>,
+        clipboard: ClipboardQueues,
         palette: Arc<Mutex<Option<okena_core::theme::ThemeColors>>>,
         transport: Arc<dyn TerminalTransport>,
         terminal_id: String,
     ) -> Self {
-        Self { title, has_bell, bell_pending, pending_clipboard, palette, transport, terminal_id }
+        Self {
+            title,
+            has_bell,
+            bell_pending,
+            clipboard,
+            palette,
+            transport,
+            terminal_id,
+        }
     }
 
     /// Resolve a color index (as passed by alacritty on a color query) to an
@@ -119,7 +144,17 @@ impl EventListener for ZedEventListener {
                 self.bell_pending.store(true, Ordering::Relaxed);
             }
             TermEvent::ClipboardStore(_, text) => {
-                self.pending_clipboard.lock().push(text);
+                self.clipboard.writes.lock().push(text);
+            }
+            TermEvent::ClipboardLoad(_ty, formatter) => {
+                // An app asked to READ the clipboard (`OSC 52 ; c ; ?`). We
+                // can't read the system clipboard here (no `cx` on this
+                // thread), so queue the formatter; the GPUI thread drains it
+                // later, gated behind the opt-in `allow_clipboard_read`
+                // setting. The `ClipboardType` is ignored — primary-selection
+                // requests are answered from the regular clipboard like the
+                // rest, which matches what most terminals do.
+                self.clipboard.reads.lock().push(formatter);
             }
             TermEvent::ColorRequest(index, response_fn) => {
                 if let Some((r, g, b)) = self.resolve_color(index) {

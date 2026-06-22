@@ -192,6 +192,17 @@ impl SettingsPanel {
                         ))
                     })
             })
+            .child(section_header("Clipboard", &t, cx))
+            .child(
+                section_container(&t).child(self.render_toggle(
+                    "clipboard-read",
+                    "Allow Clipboard Read (OSC 52)",
+                    s.allow_clipboard_read,
+                    false,
+                    |state, val, cx| state.set_allow_clipboard_read(val, cx),
+                    cx,
+                )),
+            )
     }
 
     fn render_header_density_row(

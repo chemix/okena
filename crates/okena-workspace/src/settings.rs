@@ -388,6 +388,12 @@ pub struct AppSettings {
     /// (OSC 9/777 alerts and the bell). Opt-in — see [`NotificationSettings`].
     #[serde(default)]
     pub notifications: NotificationSettings,
+
+    /// Allow terminal apps to READ the system clipboard via OSC 52 (`OSC 52 ; c ; ?`).
+    /// Off by default: clipboard read lets a program exfiltrate whatever you have
+    /// copied. OSC 52 *write* is always allowed; only read is gated.
+    #[serde(default)]
+    pub allow_clipboard_read: bool,
 }
 
 impl Default for AppSettings {
@@ -439,6 +445,7 @@ impl Default for AppSettings {
             file_finder: FileFinderSettings::default(),
             header_density: HeaderDensity::default(),
             notifications: NotificationSettings::default(),
+            allow_clipboard_read: false,
         }
     }
 }

@@ -1,3 +1,14 @@
+/// Formatter for an OSC 52 clipboard *read* request.
+///
+/// `alacritty_terminal` hands us this closure with the
+/// `Event::ClipboardLoad` event: given the current clipboard text, it
+/// returns the full escape sequence (`OSC 52 ; c ; <base64> ST`) to write
+/// back to the PTY so the requesting app receives the contents. We can't
+/// run it inline (the listener has no access to the system clipboard on the
+/// GPUI thread), so the closure is queued and invoked later once the
+/// clipboard has been read with a `cx`.
+pub type ClipboardReadResponder = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Terminal size in cells and pixels
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalSize {
