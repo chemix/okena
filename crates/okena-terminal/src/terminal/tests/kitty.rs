@@ -8,7 +8,7 @@
 
 use super::super::Terminal;
 use super::super::types::TerminalSize;
-use super::NullTransport;
+use super::{CapturingTransport, NullTransport};
 use crate::input::{KeyEvent, KeyModifiers, key_to_bytes};
 use std::sync::Arc;
 
@@ -65,4 +65,34 @@ fn escape_encodes_as_csi_u_only_after_push() {
         key_to_bytes(&esc, false, t.kitty_keyboard_flags()),
         Some(b"\x1b[27u".to_vec())
     );
+}
+
+#[test]
+fn send_escape_and_backtab_actions_are_kitty_aware() {
+    // Esc / Tab / Shift+Tab arrive via dedicated GPUI actions that bypass the
+    // on_key_down path; `Terminal::send_escape` / `send_backtab` route them back
+    // through the encoder. Guard that they honor the live kitty flag.
+    let transport = Arc::new(CapturingTransport::new());
+    let t = Terminal::new(
+        "test-id".to_string(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".to_string(),
+    );
+
+    // Legacy before the protocol is enabled.
+    t.send_escape();
+    t.send_backtab();
+    assert_eq!(transport.writes(), vec![b"\x1b".to_vec(), b"\x1b[Z".to_vec()]);
+
+    // After the app pushes disambiguate, the same actions emit CSI u.
+    t.process_output(b"\x1b[>1u");
+    t.send_escape();
+    t.send_backtab();
+    let writes = transport.writes();
+    assert_eq!(&writes[2..], &[b"\x1b[27u".to_vec(), b"\x1b[9;2u".to_vec()]);
+
+    // Plain Tab is never disambiguated at level 1.
+    t.send_tab();
+    assert_eq!(transport.writes().last().unwrap(), b"\t");
 }

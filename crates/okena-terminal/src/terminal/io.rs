@@ -206,6 +206,45 @@ impl Terminal {
         self.transport.send_input(&self.terminal_id, data);
     }
 
+    /// Send a named special key (Esc / Tab / Shift+Tab) the way the running app
+    /// expects, honoring app-cursor and kitty-keyboard modes.
+    ///
+    /// These keys are delivered via dedicated GPUI actions (so they take part
+    /// in context routing — e.g. Esc closes search in the search bar but goes
+    /// to the PTY here) instead of the raw `on_key_down` path, so they bypass
+    /// the encoder unless routed back through it here. Reusing `key_to_bytes`
+    /// keeps them in lockstep with normal key handling (notably the kitty
+    /// `CSI u` disambiguation: `Esc` → `CSI 27 u`, `Shift+Tab` → `CSI 9 ; 2 u`).
+    fn send_named_key(&self, key: &str, shift: bool) {
+        let event = crate::input::KeyEvent {
+            key: key.to_string(),
+            key_char: None,
+            modifiers: crate::input::KeyModifiers { shift, ..Default::default() },
+        };
+        if let Some(bytes) = crate::input::key_to_bytes(
+            &event,
+            self.is_app_cursor_mode(),
+            self.kitty_keyboard_flags(),
+        ) {
+            self.send_bytes(&bytes);
+        }
+    }
+
+    /// Send the Escape key (kitty-aware: `CSI 27 u` in disambiguate mode).
+    pub fn send_escape(&self) {
+        self.send_named_key("escape", false);
+    }
+
+    /// Send the Tab key (plain `\t`; unchanged by kitty level 1).
+    pub fn send_tab(&self) {
+        self.send_named_key("tab", false);
+    }
+
+    /// Send Shift+Tab / backtab (kitty-aware: `CSI 9 ; 2 u` in disambiguate mode).
+    pub fn send_backtab(&self) {
+        self.send_named_key("tab", true);
+    }
+
     /// Clear the terminal screen by sending the clear sequence
     pub fn clear(&self) {
         // Send ANSI escape sequence to clear screen and move cursor to home

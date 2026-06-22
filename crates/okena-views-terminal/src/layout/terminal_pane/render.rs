@@ -152,9 +152,9 @@ impl<D: ActionDispatch + Send + Sync> Render for TerminalPane<D> {
             .on_action(cx.listener(|this, _: &FocusDown, window, cx| { this.handle_navigation(NavigationDirection::Down, window, cx); }))
             .on_action(cx.listener(|this, _: &FocusNextTerminal, window, cx| { this.handle_sequential_navigation(true, window, cx); }))
             .on_action(cx.listener(|this, _: &FocusPrevTerminal, window, cx| { this.handle_sequential_navigation(false, window, cx); }))
-            .on_action(cx.listener(|this, _: &SendTab, _window, _cx| { if let Some(ref terminal) = this.terminal { terminal.send_bytes(b"\t"); } }))
-            .on_action(cx.listener(|this, _: &SendBacktab, _window, _cx| { if let Some(ref terminal) = this.terminal { terminal.send_bytes(b"\x1b[Z"); } }))
-            .on_action(cx.listener(|this, _: &SendEscape, _window, _cx| { if let Some(ref terminal) = this.terminal { terminal.send_bytes(b"\x1b"); } }))
+            .on_action(cx.listener(|this, _: &SendTab, _window, _cx| { if let Some(ref terminal) = this.terminal { terminal.send_tab(); } }))
+            .on_action(cx.listener(|this, _: &SendBacktab, _window, _cx| { if let Some(ref terminal) = this.terminal { terminal.send_backtab(); } }))
+            .on_action(cx.listener(|this, _: &SendEscape, _window, _cx| { if let Some(ref terminal) = this.terminal { terminal.send_escape(); } }))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
                 let current = this.workspace.read(cx).get_terminal_zoom(&this.project_id, &this.layout_path);
                 let new_zoom = (current + 0.1).clamp(0.5, 3.0);
