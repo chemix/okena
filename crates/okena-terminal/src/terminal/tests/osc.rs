@@ -162,6 +162,79 @@ fn test_osc7_invalid_scheme_ignored() {
 }
 
 #[test]
+fn test_osc1337_current_dir_bel_terminated() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    assert_eq!(terminal.reported_cwd(), None);
+
+    // iTerm2 shell integration: OSC 1337 ; CurrentDir=<raw path> BEL. The path
+    // is a plain filesystem path — no file:// scheme, no percent-encoding.
+    terminal.process_output(b"\x1b]1337;CurrentDir=/home/matej/projects/okena\x07");
+
+    assert_eq!(
+        terminal.reported_cwd().as_deref(),
+        Some("/home/matej/projects/okena"),
+    );
+    assert_eq!(terminal.current_cwd(), "/home/matej/projects/okena");
+}
+
+#[test]
+fn test_osc1337_current_dir_st_terminated() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // ST-terminated form (ESC \) is equally valid.
+    terminal.process_output(b"\x1b]1337;CurrentDir=/var/www\x1b\\");
+
+    assert_eq!(terminal.reported_cwd().as_deref(), Some("/var/www"));
+}
+
+#[test]
+fn test_osc1337_empty_current_dir_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // An empty / whitespace-only path must not overwrite the cwd.
+    terminal.process_output(b"\x1b]1337;CurrentDir=\x07");
+    terminal.process_output(b"\x1b]1337;CurrentDir=   \x07");
+
+    assert_eq!(terminal.reported_cwd(), None);
+}
+
+#[test]
+fn test_osc1337_non_current_dir_subcommand_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // 1337 carries many subcommands; only CurrentDir is ours. RemoteHost (and
+    // the rest) must leave the cwd untouched.
+    terminal.process_output(b"\x1b]1337;RemoteHost=matej@myhost\x07");
+
+    assert_eq!(terminal.reported_cwd(), None);
+}
+
+#[test]
 fn test_parse_osc7_file_uri() {
     assert_eq!(
         parse_osc7_file_uri("file:///home/user").as_deref(),

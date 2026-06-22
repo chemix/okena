@@ -217,6 +217,31 @@ impl Perform for SidecarPerform {
                     *self.reported_cwd.lock() = Some(path);
                 }
             }
+            b"1337" => {
+                // iTerm2's proprietary `OSC 1337 ; key=value` channel. We only
+                // honour `CurrentDir=<path>`, which some shell integrations emit
+                // instead of `OSC 7`; it feeds the *same* `reported_cwd` so the
+                // sidebar / "new tab here" / cwd tracking work regardless of
+                // which sequence the shell speaks. All other 1337 subcommands
+                // (RemoteHost, SetUserVar, File, …) have no consumer here and
+                // are deliberately ignored rather than parsed into dead code.
+                //
+                // Unlike OSC 7, the value is a raw filesystem path — not a
+                // `file://` URI and not percent-encoded. A path may legitimately
+                // contain `;`, so rejoin the split tail like the OSC 7 / 777
+                // arms in case the parser broke the value apart.
+                let payload: String = params[1..]
+                    .iter()
+                    .filter_map(|p| std::str::from_utf8(p).ok())
+                    .collect::<Vec<_>>()
+                    .join(";");
+                if let Some(value) = payload.strip_prefix("CurrentDir=") {
+                    let path = value.trim();
+                    if !path.is_empty() {
+                        *self.reported_cwd.lock() = Some(path.to_string());
+                    }
+                }
+            }
             b"9" => {
                 // iTerm2-style notification: `OSC 9 ; <message>`. ConEmu's
                 // `OSC 9 ; 4 ; state ; progress` progress-bar subtype is
