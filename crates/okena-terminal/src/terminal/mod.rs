@@ -328,6 +328,13 @@ impl Terminal {
                 shape: VteCursorShape::HollowBlock,
                 blinking: false,
             },
+            // Enable the kitty keyboard protocol. alacritty gates ALL of its
+            // keyboard-mode handling (push/pop/set/report of `CSI u` mode
+            // sequences) behind this flag — with it off, an app's request to
+            // enable the protocol is silently ignored and `term.mode()` never
+            // reflects it, so `kitty_keyboard_flags()` would always read false
+            // and our encoder (see `input::key_to_bytes`) would never fire.
+            kitty_keyboard: true,
             // Accept OSC 52 *read* (paste) sequences in addition to writes.
             // alacritty's default `OnlyCopy` silently drops `OSC 52 ; c ; ?`
             // and never emits `ClipboardLoad`; `CopyPaste` makes it emit the
