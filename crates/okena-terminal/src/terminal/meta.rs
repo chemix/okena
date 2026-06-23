@@ -19,12 +19,51 @@ impl Terminal {
         std::mem::take(&mut *self.pending_clipboard.lock())
     }
 
+    /// Whether the running app has queued any OSC 52 clipboard *read* requests
+    /// (`OSC 52 ; c ; ?`) since the last drain. The PTY event loop checks this
+    /// per dirty terminal before deciding whether to read the system clipboard
+    /// (only when the opt-in setting is on) or silently drop the requests.
+    pub fn has_pending_clipboard_reads(&self) -> bool {
+        !self.pending_clipboard_reads.lock().is_empty()
+    }
+
+    /// Answer all queued OSC 52 clipboard *read* requests with `content`,
+    /// draining the queue. For each queued formatter we build the reply
+    /// (`OSC 52 ; c ; <base64> ST`) and write it straight back to the PTY via
+    /// the transport — not `send_bytes` — so a clipboard read doesn't set
+    /// `had_user_input` or scroll the view, mirroring how color-query replies
+    /// are written directly in the event listener. Only call this when the
+    /// user has opted into clipboard reads.
+    pub fn answer_clipboard_reads(&self, content: &str) {
+        let responders = std::mem::take(&mut *self.pending_clipboard_reads.lock());
+        for responder in responders {
+            let reply = responder(content);
+            self.transport.send_input(&self.terminal_id, reply.as_bytes());
+        }
+    }
+
+    /// Drop all queued OSC 52 clipboard *read* requests without replying.
+    /// Used when the `allow_clipboard_read` setting is off: the request is
+    /// silently denied (the app gets no response), but the queue is still
+    /// cleared so it stays bounded across batches.
+    pub fn drop_clipboard_reads(&self) {
+        self.pending_clipboard_reads.lock().clear();
+    }
+
     /// Take any pending `OSC 9` / `OSC 777` notifications. The GPUI thread
     /// drains these in the PTY event loop to surface native desktop
     /// notifications for background panes whose command finished or needs
     /// input while the user was elsewhere.
     pub fn take_pending_notifications(&self) -> Vec<super::TerminalNotification> {
         std::mem::take(&mut *self.pending_notifications.lock())
+    }
+
+    /// Active `OSC 9 ; 4` (ConEmu / Windows Terminal) progress report, or
+    /// `None` when the running program isn't reporting progress (it never
+    /// started one, or sent `st=0` to clear it). Read each render to drive a
+    /// per-tab / per-pane progress indicator.
+    pub fn progress(&self) -> Option<super::TerminalProgress> {
+        *self.progress.lock()
     }
 
     /// Push the active theme palette so the event listener can answer

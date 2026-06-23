@@ -922,6 +922,9 @@ impl Okena {
                         // Stamp project activity for any command that finished
                         // this batch (OSC 133 ;D), independent of bell/OSC alerts.
                         this.process_command_finished_activity(&dirty_terminal_ids, cx);
+                        // Answer (or, when disabled, drop) OSC 52 clipboard
+                        // read requests queued by these terminals.
+                        this.process_clipboard_reads(&dirty_terminal_ids, cx);
                     }
 
                     if !exit_events.is_empty() {

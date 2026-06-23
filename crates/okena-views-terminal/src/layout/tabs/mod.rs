@@ -12,6 +12,7 @@ use okena_ui::header_buttons::{header_button_base, ButtonSize, HeaderAction};
 use crate::layout::layout_container::{LayoutContainer, is_renaming, rename_input};
 use crate::layout::pane_drag::{PaneDrag, PaneDragView};
 use crate::simple_input::SimpleInput;
+use okena_terminal::terminal::TerminalProgressState;
 use okena_workspace::state::{LayoutNode, SplitDirection};
 use gpui::*;
 use gpui_component::{h_flex, v_flex};
@@ -380,13 +381,14 @@ impl<D: ActionDispatch + Send + Sync> LayoutContainer<D> {
                 _ => None,
             };
 
-            let (is_waiting, idle_label) = terminal_id.as_ref().map_or((false, None), |tid| {
+            let (is_waiting, idle_label, progress) = terminal_id.as_ref().map_or((false, None, None), |tid| {
                 let guard = terminals.lock();
-                guard.get(tid).map_or((false, None), |t| {
+                guard.get(tid).map_or((false, None, None), |t| {
+                    let progress = t.progress();
                     if t.is_waiting_for_input() {
-                        (true, Some(t.idle_duration_display()))
+                        (true, Some(t.idle_duration_display()), progress)
                     } else {
-                        (false, None)
+                        (false, None, progress)
                     }
                 })
             });
@@ -493,9 +495,57 @@ impl<D: ActionDispatch + Send + Sync> LayoutContainer<D> {
                             .children(idle_label.as_ref().map(|d| {
                                 div().text_size(ui_text_sm(cx)).text_color(rgb(t.border_idle)).child(d.clone())
                             }))
+                            // Determinate OSC 9;4 progress also shows a percentage in
+                            // the label, so it reads even when the bar is a thin sliver.
+                            // Indeterminate progress has no meaningful value, so it's
+                            // bar-only.
+                            .children(
+                                progress
+                                    .and_then(|p| match p.state {
+                                        TerminalProgressState::Indeterminate => None,
+                                        _ => Some(p.value.min(100)),
+                                    })
+                                    .map(|pct| {
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(ui_text_sm(cx))
+                                            .text_color(rgb(t.text_muted))
+                                            .child(format!("{pct}%"))
+                                    }),
+                            )
                             .into_any_element()
                     }
                 })
+                .children(progress.map(|p| {
+                    // Color the bar by reported progress state.
+                    let fill_color = match p.state {
+                        TerminalProgressState::Normal => t.border_active,
+                        TerminalProgressState::Error => t.error,
+                        TerminalProgressState::Paused => t.warning,
+                        TerminalProgressState::Indeterminate => t.border_active,
+                    };
+                    // Determinate states fill `value`%; an indeterminate "busy"
+                    // bar is rendered full width at a reduced alpha (no animation).
+                    let (fill_fraction, fill_alpha) = match p.state {
+                        TerminalProgressState::Indeterminate => (1.0_f32, 0.5_f32),
+                        _ => (p.value.min(100) as f32 / 100.0, 1.0_f32),
+                    };
+                    // Absolutely-positioned track pinned to the bottom edge,
+                    // overlaying the tab's bottom border.
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(3.0))
+                        .bg(with_alpha(t.border_active, 0.15))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(fill_fraction))
+                                .bg(with_alpha(fill_color, fill_alpha)),
+                        )
+                }))
                 .on_mouse_down(MouseButton::Right, {
                     let project_id = project_id.clone();
                     let layout_path = layout_path.clone();

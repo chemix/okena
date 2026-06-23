@@ -229,6 +229,67 @@ impl Okena {
         self.bump_activity_for_terminals(finished.iter().map(|s| s.as_str()), cx);
     }
 
+    /// Answer (or silently deny) OSC 52 clipboard *read* requests
+    /// (`OSC 52 ; c ; ?`) queued by terminals that produced output this batch.
+    /// Runs here, in the PTY event loop, because this is where the opt-in
+    /// setting and the system clipboard are reachable — the event listener
+    /// that enqueues the requests has neither.
+    ///
+    /// Clipboard read is gated behind `allow_clipboard_read` (off by default):
+    /// a program reading the clipboard can exfiltrate whatever the user has
+    /// copied. When allowed, every requesting terminal gets the current
+    /// clipboard contents; when not, the requests are dropped without a reply
+    /// so the per-terminal queues stay bounded.
+    pub(super) fn process_clipboard_reads(
+        &mut self,
+        dirty_terminal_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        // Collect the terminals that actually have a queued read. Almost every
+        // batch has none, so we bail before touching settings or the clipboard.
+        let pending: Vec<String> = {
+            let reg = self.terminals.lock();
+            dirty_terminal_ids
+                .iter()
+                .filter(|tid| reg.get(*tid).is_some_and(|t| t.has_pending_clipboard_reads()))
+                .cloned()
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+
+        // Read the opt-in setting once for the whole batch.
+        let allow = crate::settings::settings_entity(cx)
+            .read(cx)
+            .get()
+            .allow_clipboard_read;
+
+        if allow {
+            // Read the system clipboard once; hand the same contents to every
+            // requesting terminal. An empty/imageless clipboard answers "".
+            let content = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            let reg = self.terminals.lock();
+            for tid in &pending {
+                if let Some(term) = reg.get(tid) {
+                    term.answer_clipboard_reads(&content);
+                }
+            }
+        } else {
+            // Silently deny: drop the queued requests without replying so the
+            // queue stays bounded while the feature is off.
+            let reg = self.terminals.lock();
+            for tid in &pending {
+                if let Some(term) = reg.get(tid) {
+                    term.drop_clipboard_reads();
+                }
+            }
+        }
+    }
+
     /// Resolve each terminal id to its owning project and bump that project's
     /// activity timestamp once. Deduplicates projects so a batch touching
     /// several terminals of the same project only notifies/persists once.

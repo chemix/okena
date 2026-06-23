@@ -1,3 +1,14 @@
+/// Formatter for an OSC 52 clipboard *read* request.
+///
+/// `alacritty_terminal` hands us this closure with the
+/// `Event::ClipboardLoad` event: given the current clipboard text, it
+/// returns the full escape sequence (`OSC 52 ; c ; <base64> ST`) to write
+/// back to the PTY so the requesting app receives the contents. We can't
+/// run it inline (the listener has no access to the system clipboard on the
+/// GPUI thread), so the closure is queued and invoked later once the
+/// clipboard has been read with a `cx`.
+pub type ClipboardReadResponder = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Terminal size in cells and pixels
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalSize {
@@ -61,6 +72,39 @@ pub struct PromptMark {
     pub kind: PromptMarkKind,
     pub line: i32,
     pub column: usize,
+}
+
+/// Progress state reported via the ConEmu / Windows Terminal protocol
+/// `OSC 9 ; 4 ; st ; pr` (also spoken by WezTerm, Ghostty, Kitty, …).
+///
+/// Programs like npm, cargo, and downloaders emit this to drive a taskbar /
+/// tab progress indicator. The `st` field selects the variant; `pr` carries
+/// the 0..=100 percentage where applicable (see [`TerminalProgress`]). The
+/// `st=0` "remove" state has no variant here — it clears the progress to
+/// `None` rather than being represented as a state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalProgressState {
+    /// `st=1` — a normal, determinate progress bar at `value` percent.
+    Normal,
+    /// `st=2` — an error occurred; `value` keeps the last/explicit percent.
+    Error,
+    /// `st=3` — indeterminate work (a spinner); `value` is meaningless.
+    Indeterminate,
+    /// `st=4` — paused or warning; `value` keeps the last/explicit percent.
+    Paused,
+}
+
+/// Active progress reported by the running program via `OSC 9 ; 4`.
+///
+/// The owning [`Terminal`](super::Terminal) holds `Option<TerminalProgress>`:
+/// `None` means no progress is being reported (the program never started one
+/// or sent `st=0` to clear it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalProgress {
+    pub state: TerminalProgressState,
+    /// Percentage in `0..=100`. Ignored for
+    /// [`TerminalProgressState::Indeterminate`].
+    pub value: u8,
 }
 
 /// Cursor shape requested by the terminal application via DECSCUSR.

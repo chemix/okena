@@ -2,7 +2,9 @@ use super::super::Terminal;
 use super::super::TerminalNotification;
 use super::super::app_version::set_app_version;
 use super::super::osc_sidecar::parse_osc7_file_uri;
-use super::super::types::{PromptMarkKind, TerminalSize};
+use super::super::types::{
+    PromptMarkKind, TerminalProgress, TerminalProgressState, TerminalSize,
+};
 use super::{CapturingTransport, NullTransport};
 use std::sync::Arc;
 
@@ -162,6 +164,79 @@ fn test_osc7_invalid_scheme_ignored() {
 }
 
 #[test]
+fn test_osc1337_current_dir_bel_terminated() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    assert_eq!(terminal.reported_cwd(), None);
+
+    // iTerm2 shell integration: OSC 1337 ; CurrentDir=<raw path> BEL. The path
+    // is a plain filesystem path — no file:// scheme, no percent-encoding.
+    terminal.process_output(b"\x1b]1337;CurrentDir=/home/matej/projects/okena\x07");
+
+    assert_eq!(
+        terminal.reported_cwd().as_deref(),
+        Some("/home/matej/projects/okena"),
+    );
+    assert_eq!(terminal.current_cwd(), "/home/matej/projects/okena");
+}
+
+#[test]
+fn test_osc1337_current_dir_st_terminated() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // ST-terminated form (ESC \) is equally valid.
+    terminal.process_output(b"\x1b]1337;CurrentDir=/var/www\x1b\\");
+
+    assert_eq!(terminal.reported_cwd().as_deref(), Some("/var/www"));
+}
+
+#[test]
+fn test_osc1337_empty_current_dir_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // An empty / whitespace-only path must not overwrite the cwd.
+    terminal.process_output(b"\x1b]1337;CurrentDir=\x07");
+    terminal.process_output(b"\x1b]1337;CurrentDir=   \x07");
+
+    assert_eq!(terminal.reported_cwd(), None);
+}
+
+#[test]
+fn test_osc1337_non_current_dir_subcommand_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // 1337 carries many subcommands; only CurrentDir is ours. RemoteHost (and
+    // the rest) must leave the cwd untouched.
+    terminal.process_output(b"\x1b]1337;RemoteHost=matej@myhost\x07");
+
+    assert_eq!(terminal.reported_cwd(), None);
+}
+
+#[test]
 fn test_parse_osc7_file_uri() {
     assert_eq!(
         parse_osc7_file_uri("file:///home/user").as_deref(),
@@ -294,6 +369,128 @@ fn test_osc9_st_terminator() {
     assert_eq!(
         terminal.take_pending_notifications(),
         vec![body("hello")],
+    );
+}
+
+#[test]
+fn test_osc9_4_st1_sets_normal_progress() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    assert_eq!(terminal.progress(), None);
+
+    // OSC 9 ; 4 ; 1 ; 42 → normal progress at 42%.
+    terminal.process_output(b"\x1b]9;4;1;42\x07");
+
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Normal, value: 42 }),
+    );
+    // Progress is sticky (not drained on read).
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Normal, value: 42 }),
+    );
+}
+
+#[test]
+fn test_osc9_4_st0_clears_progress() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    terminal.process_output(b"\x1b]9;4;1;50\x07");
+    assert!(terminal.progress().is_some());
+
+    // st=0 removes the bar; pr is ignored.
+    terminal.process_output(b"\x1b]9;4;0;\x07");
+    assert_eq!(terminal.progress(), None);
+}
+
+#[test]
+fn test_osc9_4_st3_indeterminate_ignores_value() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // st=3 is a spinner — pr is meaningless and normalised to 0.
+    terminal.process_output(b"\x1b]9;4;3;77\x07");
+
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Indeterminate, value: 0 }),
+    );
+}
+
+#[test]
+fn test_osc9_4_clamps_value_over_100() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // pr above 100 is clamped to 100.
+    terminal.process_output(b"\x1b]9;4;1;255\x07");
+
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Normal, value: 100 }),
+    );
+}
+
+#[test]
+fn test_osc9_4_st2_error_keeps_previous_value() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // Set a baseline, then signal an error without an explicit percent.
+    terminal.process_output(b"\x1b]9;4;1;30\x07");
+    terminal.process_output(b"\x1b]9;4;2;\x07");
+
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Error, value: 30 }),
+    );
+
+    // An explicit pr on the error state overrides the kept value.
+    terminal.process_output(b"\x1b]9;4;2;80\x07");
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Error, value: 80 }),
+    );
+}
+
+#[test]
+fn test_osc9_4_garbage_st_ignored() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    terminal.process_output(b"\x1b]9;4;1;25\x07");
+    // A non-numeric / out-of-range st must leave the current bar untouched and
+    // must never produce a notification.
+    terminal.process_output(b"\x1b]9;4;abc;5\x07");
+    terminal.process_output(b"\x1b]9;4;9;5\x07");
+
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Normal, value: 25 }),
+    );
+    assert!(terminal.take_pending_notifications().is_empty());
+}
+
+#[test]
+fn test_osc9_4_does_not_produce_notification() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new("t".into(), TerminalSize::default(), transport, "/tmp".into());
+
+    // The progress subtype must NOT be treated as notification text...
+    terminal.process_output(b"\x1b]9;4;1;42\x07");
+    assert!(terminal.take_pending_notifications().is_empty());
+    assert!(terminal.progress().is_some());
+
+    // ...while a plain OSC 9 message still produces a notification and leaves
+    // progress untouched (no regression).
+    terminal.process_output(b"\x1b]9;Build complete\x07");
+    assert_eq!(terminal.take_pending_notifications(), vec![body("Build complete")]);
+    assert_eq!(
+        terminal.progress(),
+        Some(TerminalProgress { state: TerminalProgressState::Normal, value: 42 }),
     );
 }
 
@@ -433,6 +630,153 @@ fn test_bell_edge_is_one_shot() {
 
     // The sticky UI flag is independent of the one-shot notification edge.
     assert!(terminal.has_bell(), "has_bell stays set until focus clears it");
+}
+
+#[test]
+fn test_osc52_read_request_queues_responder() {
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".into(),
+    );
+
+    assert!(!terminal.has_pending_clipboard_reads(), "nothing queued yet");
+
+    // OSC 52 ; c ; ? — the app asks to READ the clipboard.
+    terminal.process_output(b"\x1b]52;c;?\x07");
+
+    assert!(
+        terminal.has_pending_clipboard_reads(),
+        "a read request must be queued",
+    );
+    // Queuing the request must not write anything to the PTY on its own —
+    // the reply is only sent once answered with clipboard contents.
+    assert!(
+        transport.writes().is_empty(),
+        "no PTY reply until answered: {:?}",
+        transport.writes(),
+    );
+}
+
+#[test]
+fn test_osc52_answer_clipboard_reads_replies_and_drains() {
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".into(),
+    );
+
+    terminal.process_output(b"\x1b]52;c;?\x07");
+    assert!(terminal.has_pending_clipboard_reads());
+
+    terminal.answer_clipboard_reads("hi");
+
+    // The queue is drained once answered.
+    assert!(
+        !terminal.has_pending_clipboard_reads(),
+        "queue must be empty after answering",
+    );
+    // A non-empty OSC 52 response was written back to the PTY.
+    let writes = transport.writes();
+    assert_eq!(writes.len(), 1, "expected exactly one PTY reply");
+    assert!(!writes[0].is_empty(), "reply must not be empty");
+    let body = std::str::from_utf8(&writes[0]).unwrap();
+    assert!(body.contains("52;"), "reply should be an OSC 52 sequence: {body:?}");
+}
+
+#[test]
+fn test_osc52_drop_clipboard_reads_clears_without_reply() {
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport.clone(),
+        "/tmp".into(),
+    );
+
+    terminal.process_output(b"\x1b]52;c;?\x07");
+    assert!(terminal.has_pending_clipboard_reads());
+
+    // Silent deny: drop the request without writing anything to the PTY.
+    terminal.drop_clipboard_reads();
+
+    assert!(!terminal.has_pending_clipboard_reads(), "queue must be cleared");
+    assert!(
+        transport.writes().is_empty(),
+        "dropping must not reply: {:?}",
+        transport.writes(),
+    );
+}
+
+#[test]
+fn test_osc52_write_does_not_enqueue_read() {
+    let transport = Arc::new(NullTransport);
+    let terminal = Terminal::new(
+        "t".into(),
+        TerminalSize::default(),
+        transport,
+        "/tmp".into(),
+    );
+
+    // A plain OSC 52 *write* (base64 "hi" == "aGk=") stores clipboard text and
+    // must NOT enqueue a read request.
+    terminal.process_output(b"\x1b]52;c;aGk=\x07");
+
+    assert!(
+        !terminal.has_pending_clipboard_reads(),
+        "a write must not enqueue a read",
+    );
+    assert_eq!(
+        terminal.take_pending_clipboard_writes(),
+        vec!["hi".to_string()],
+        "the write text must reach the clipboard-write queue",
+    );
+}
+
+#[test]
+fn test_xtwinops_14t_reports_text_area_size_in_pixels() {
+    // Explicit size so the pixel math is unambiguous: 80 cols x 24 rows at
+    // 8x16 px cells → text area is 640 px wide and 384 px tall.
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        cell_width: 8.0,
+        cell_height: 16.0,
+    };
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new("t".into(), size, transport.clone(), "/tmp".into());
+
+    // CSI 14 t — report text-area size in pixels.
+    terminal.process_output(b"\x1b[14t");
+
+    let writes = transport.writes();
+    assert_eq!(writes.len(), 1, "expected exactly one PTY reply");
+    // Reply is `CSI 4 ; <height> ; <width> t` = rows*cell_height ; cols*cell_width.
+    assert_eq!(writes[0], b"\x1b[4;384;640t");
+}
+
+#[test]
+fn test_xtwinops_18t_still_reports_size_in_cells() {
+    // No regression: CSI 18 t (size in cells) keeps replying via PtyWrite.
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        cell_width: 8.0,
+        cell_height: 16.0,
+    };
+    let transport = Arc::new(CapturingTransport::new());
+    let terminal = Terminal::new("t".into(), size, transport.clone(), "/tmp".into());
+
+    terminal.process_output(b"\x1b[18t");
+
+    let writes = transport.writes();
+    assert_eq!(writes.len(), 1, "expected exactly one PTY reply");
+    // Reply is `CSI 8 ; <rows> ; <cols> t`.
+    assert_eq!(writes[0], b"\x1b[8;24;80t");
 }
 
 #[test]

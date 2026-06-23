@@ -4,6 +4,40 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::transport::TerminalTransport;
+use super::types::{ClipboardReadResponder, ResizeState};
+
+/// The two OSC 52 clipboard queues the listener shares with `Terminal`.
+///
+/// Both are `Arc`-shared with the owning `Terminal` (which holds the same
+/// `Arc`s as separate fields) and pushed here during `process_output`, then
+/// drained on the GPUI thread. They are grouped into one struct so the
+/// listener constructor stays compact as more shared state is added.
+pub(super) struct ClipboardQueues {
+    /// Pending OSC 52 clipboard writes to be picked up by the GPUI thread.
+    pub writes: Arc<Mutex<Vec<String>>>,
+    /// Pending OSC 52 clipboard *read* requests (`OSC 52 ; c ; ?`), each
+    /// carrying a formatter that turns clipboard text into the PTY reply.
+    /// Drained on the GPUI thread, where the system clipboard and the opt-in
+    /// setting gating reads are reachable.
+    pub reads: Arc<Mutex<Vec<ClipboardReadResponder>>>,
+}
+
+/// The current terminal state the listener reads to answer terminal queries.
+///
+/// Both fields are `Arc`-shared with the owning `Terminal` (which holds the
+/// same `Arc`s) and read here during `process_output` to compose replies:
+/// `palette` answers OSC 10/11/12/4 color queries, `resize_state` answers the
+/// `CSI 14 t` (XTWINOPS) text-area-size-in-pixels query. They are grouped into
+/// one struct so the listener constructor stays compact as more shared state
+/// is added.
+pub(super) struct CurrentState {
+    /// Current theme palette, pushed from the GPUI thread on each render.
+    /// Used to answer OSC 10/11/12/4 color queries from apps.
+    pub palette: Arc<Mutex<Option<okena_core::theme::ThemeColors>>>,
+    /// Current terminal size, kept up to date by `resize`. Read to answer the
+    /// `CSI 14 t` XTWINOPS query (report text-area size in pixels).
+    pub resize_state: Arc<Mutex<ResizeState>>,
+}
 
 /// Event listener for alacritty_terminal that captures title changes, bell, and PTY write requests
 pub struct ZedEventListener {
@@ -15,11 +49,11 @@ pub struct ZedEventListener {
     /// event loop to fire a desktop notification exactly once per bell rather
     /// than on every batch while `has_bell` stays set.
     bell_pending: Arc<AtomicBool>,
-    /// Pending OSC 52 clipboard writes to be picked up by the GPUI thread
-    pending_clipboard: Arc<Mutex<Vec<String>>>,
-    /// Current theme palette, pushed from the GPUI thread on each render.
-    /// Used to answer OSC 10/11/12/4 color queries from apps.
-    palette: Arc<Mutex<Option<okena_core::theme::ThemeColors>>>,
+    /// Pending OSC 52 clipboard write/read queues, shared with `Terminal`.
+    clipboard: ClipboardQueues,
+    /// Current state the listener reads to answer terminal queries (theme
+    /// palette for color queries, size for the XTWINOPS size query).
+    state: CurrentState,
     /// Transport for writing responses back to the terminal
     transport: Arc<dyn TerminalTransport>,
     /// Terminal ID for PTY write operations
@@ -27,16 +61,24 @@ pub struct ZedEventListener {
 }
 
 impl ZedEventListener {
-    pub fn new(
+    pub(super) fn new(
         title: Arc<Mutex<Option<String>>>,
         has_bell: Arc<Mutex<bool>>,
         bell_pending: Arc<AtomicBool>,
-        pending_clipboard: Arc<Mutex<Vec<String>>>,
-        palette: Arc<Mutex<Option<okena_core::theme::ThemeColors>>>,
+        clipboard: ClipboardQueues,
+        state: CurrentState,
         transport: Arc<dyn TerminalTransport>,
         terminal_id: String,
     ) -> Self {
-        Self { title, has_bell, bell_pending, pending_clipboard, palette, transport, terminal_id }
+        Self {
+            title,
+            has_bell,
+            bell_pending,
+            clipboard,
+            state,
+            transport,
+            terminal_id,
+        }
     }
 
     /// Resolve a color index (as passed by alacritty on a color query) to an
@@ -58,7 +100,7 @@ impl ZedEventListener {
             return Some(xterm_256_grayscale_rgb(index));
         }
 
-        let palette = self.palette.lock();
+        let palette = self.state.palette.lock();
         let colors = palette.as_ref()?;
         let hex = match index {
             0 => colors.term_black,
@@ -119,7 +161,17 @@ impl EventListener for ZedEventListener {
                 self.bell_pending.store(true, Ordering::Relaxed);
             }
             TermEvent::ClipboardStore(_, text) => {
-                self.pending_clipboard.lock().push(text);
+                self.clipboard.writes.lock().push(text);
+            }
+            TermEvent::ClipboardLoad(_ty, formatter) => {
+                // An app asked to READ the clipboard (`OSC 52 ; c ; ?`). We
+                // can't read the system clipboard here (no `cx` on this
+                // thread), so queue the formatter; the GPUI thread drains it
+                // later, gated behind the opt-in `allow_clipboard_read`
+                // setting. The `ClipboardType` is ignored — primary-selection
+                // requests are answered from the regular clipboard like the
+                // rest, which matches what most terminals do.
+                self.clipboard.reads.lock().push(formatter);
             }
             TermEvent::ColorRequest(index, response_fn) => {
                 if let Some((r, g, b)) = self.resolve_color(index) {
@@ -127,6 +179,21 @@ impl EventListener for ZedEventListener {
                         response_fn(alacritty_terminal::vte::ansi::Rgb { r, g, b });
                     self.transport.send_input(&self.terminal_id, reply.as_bytes());
                 }
+            }
+            TermEvent::TextAreaSizeRequest(formatter) => {
+                // Answer `CSI 14 t` (report text-area size in pixels). alacritty
+                // hands us the formatter; we supply the current geometry. Cell
+                // dims are f32 pixels in TerminalSize; round to the nearest whole
+                // pixel (min 1) for the u16 WindowSize.
+                let size = self.state.resize_state.lock().size;
+                let window_size = alacritty_terminal::event::WindowSize {
+                    num_lines: size.rows,
+                    num_cols: size.cols,
+                    cell_width: (size.cell_width.round() as u16).max(1),
+                    cell_height: (size.cell_height.round() as u16).max(1),
+                };
+                let reply = formatter(window_size);
+                self.transport.send_input(&self.terminal_id, reply.as_bytes());
             }
             TermEvent::PtyWrite(data) => {
                 // Write response back to PTY (e.g., cursor position report)

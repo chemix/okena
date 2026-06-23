@@ -39,13 +39,13 @@ pub use resize_authority::{
 };
 pub use transport::TerminalTransport;
 pub use types::{
-    AppCursorShape, DetectedLink, PromptMark, PromptMarkKind, ResizeState, SelectionState,
-    TerminalSize,
+    AppCursorShape, ClipboardReadResponder, DetectedLink, PromptMark, PromptMarkKind, ResizeState,
+    SelectionState, TerminalProgress, TerminalProgressState, TerminalSize,
 };
 
 pub use osc_sidecar::TerminalNotification;
 
-use event_listener::ZedEventListener;
+use event_listener::{ClipboardQueues, CurrentState, ZedEventListener};
 use osc_sidecar::OscSidecar;
 use prompt_marks::{PromptSidecar, PromptTracker};
 use types::FocusReportState;
@@ -164,6 +164,15 @@ pub struct Terminal {
     /// GPUI thread only.
     pub(super) pending_clipboard: Arc<Mutex<Vec<String>>>,
 
+    /// Pending OSC 52 clipboard *read* requests (`OSC 52 ; c ; ?`) from the
+    /// running app, each carrying the formatter that turns clipboard text
+    /// into the PTY reply. `Arc` shared with `ZedEventListener`: pushed on
+    /// `ClipboardLoad` during `process_output`, drained on the GPUI thread
+    /// (in the PTY event loop, where the settings gate and the system
+    /// clipboard are reachable) via `answer_clipboard_reads` /
+    /// `drop_clipboard_reads`. GPUI thread only.
+    pub(super) pending_clipboard_reads: Arc<Mutex<Vec<ClipboardReadResponder>>>,
+
     /// Theme palette used to answer OSC 10/11/12/4 color queries from
     /// terminal apps. `Arc` shared with `ZedEventListener`: the render path
     /// pushes the current theme via `push_palette`, and the listener reads
@@ -181,6 +190,12 @@ pub struct Terminal {
     /// thread in the PTY event loop via `take_pending_notifications`. GPUI
     /// thread only.
     pub(super) pending_notifications: Arc<Mutex<Vec<TerminalNotification>>>,
+
+    /// Active `OSC 9 ; 4` (ConEmu / Windows Terminal) progress report, or
+    /// `None` when no progress is being shown. `Arc` shared with `OscSidecar`:
+    /// the sidecar overwrites it on each `OSC 9 ; 4` (and clears it to `None`
+    /// on `st=0`), GPUI reads via `progress`. GPUI thread only.
+    pub(super) progress: Arc<Mutex<Option<TerminalProgress>>>,
 
     /// Per-renderer focus state for DEC focus reports. A terminal can appear
     /// in multiple windows, so focus reports are derived from the aggregate
@@ -217,6 +232,14 @@ pub struct Terminal {
     /// scroll so the next walk starts from the most recent prompt again.
     /// GPUI thread only.
     pub(super) prompt_jump_index: Mutex<Option<usize>>,
+
+    /// Reverse index into the current list of prompts that produced a
+    /// non-zero exit code (0 = newest failure). `Some` while the user is
+    /// walking through failed commands with
+    /// `jump_to_prev/next_failed_command`; reset to `None` on any output or
+    /// scroll so the next walk starts from the most recent failure again.
+    /// GPUI thread only.
+    pub(super) failed_jump_index: Mutex<Option<usize>>,
 
     /// Shell process PID. Set by `set_shell_pid` (called from GPUI thread
     /// after PTY spawn), read by `shell_pid` and `has_running_child`.
@@ -305,6 +328,21 @@ impl Terminal {
                 shape: VteCursorShape::HollowBlock,
                 blinking: false,
             },
+            // Enable the kitty keyboard protocol. alacritty gates ALL of its
+            // keyboard-mode handling (push/pop/set/report of `CSI u` mode
+            // sequences) behind this flag — with it off, an app's request to
+            // enable the protocol is silently ignored and `term.mode()` never
+            // reflects it, so `kitty_keyboard_flags()` would always read false
+            // and our encoder (see `input::key_to_bytes`) would never fire.
+            kitty_keyboard: true,
+            // Accept OSC 52 *read* (paste) sequences in addition to writes.
+            // alacritty's default `OnlyCopy` silently drops `OSC 52 ; c ; ?`
+            // and never emits `ClipboardLoad`; `CopyPaste` makes it emit the
+            // event so Okena can queue the request and decide whether to
+            // answer it based on the opt-in `allow_clipboard_read` setting
+            // (off by default). The actual security gate lives in Okena, not
+            // here — alacritty just hands us the request.
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
             ..TermConfig::default()
         };
         let term_size = TermSize::new(size.cols as usize, size.rows as usize);
@@ -314,13 +352,21 @@ impl Terminal {
         let has_bell = Arc::new(Mutex::new(false));
         let bell_pending = Arc::new(AtomicBool::new(false));
         let pending_clipboard = Arc::new(Mutex::new(Vec::new()));
+        let pending_clipboard_reads = Arc::new(Mutex::new(Vec::new()));
         let palette = Arc::new(Mutex::new(None));
+        let resize_state = Arc::new(Mutex::new(ResizeState::new(size)));
         let event_listener = ZedEventListener::new(
             title.clone(),
             has_bell.clone(),
             bell_pending.clone(),
-            pending_clipboard.clone(),
-            palette.clone(),
+            ClipboardQueues {
+                writes: pending_clipboard.clone(),
+                reads: pending_clipboard_reads.clone(),
+            },
+            CurrentState {
+                palette: palette.clone(),
+                resize_state: resize_state.clone(),
+            },
             transport.clone(),
             terminal_id.clone(),
         );
@@ -328,9 +374,11 @@ impl Terminal {
 
         let reported_cwd = Arc::new(Mutex::new(None));
         let pending_notifications = Arc::new(Mutex::new(Vec::new()));
+        let progress = Arc::new(Mutex::new(None));
         let osc_sidecar = Mutex::new(OscSidecar::new(
             reported_cwd.clone(),
             pending_notifications.clone(),
+            progress.clone(),
             transport.clone(),
             terminal_id.clone(),
         ));
@@ -339,7 +387,7 @@ impl Terminal {
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             terminal_id,
-            resize_state: Arc::new(Mutex::new(ResizeState::new(size))),
+            resize_state,
             transport,
             selection_state: Mutex::new(SelectionState::default()),
             scroll_offset: Mutex::new(0),
@@ -348,6 +396,7 @@ impl Terminal {
             bell_pending,
             has_notification: AtomicBool::new(false),
             pending_clipboard,
+            pending_clipboard_reads,
             palette,
             pending_output: Mutex::new(Vec::new()),
             dirty: AtomicBool::new(false),
@@ -355,12 +404,14 @@ impl Terminal {
             initial_cwd,
             reported_cwd,
             pending_notifications,
+            progress,
             focus_report_state: Mutex::new(FocusReportState::default()),
             osc_sidecar,
             prompt_sidecar: Mutex::new(PromptSidecar::new()),
             prompt_tracker: Mutex::new(PromptTracker::new()),
             command_finished_pending: AtomicBool::new(false),
             prompt_jump_index: Mutex::new(None),
+            failed_jump_index: Mutex::new(None),
             last_output_time: Arc::new(Mutex::new(Instant::now())),
             shell_pid: Mutex::new(None),
             waiting_for_input: AtomicBool::new(false),
